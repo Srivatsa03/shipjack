@@ -100,14 +100,16 @@ def secret_from_env(var: str = SECRET_ENV) -> bytes:
     return secret
 
 
-def _check_url(url: str) -> str:
-    """Signed order data leaves only over HTTPS. Plain HTTP is allowed only to this machine, for testing."""
+def _check_url(url: str, allow_http: bool = False) -> str:
+    """Signed order data leaves only over HTTPS. Plain HTTP is allowed to this machine, and, when the
+    deployment says the network is private (``allow_http``, e.g. between containers), to any host."""
     parts = urlsplit(url)
     if parts.scheme == "https" and parts.hostname:
         return url
-    if parts.scheme == "http" and parts.hostname in _LOCAL_HOSTS:
+    if parts.scheme == "http" and parts.hostname and (parts.hostname in _LOCAL_HOSTS or allow_http):
         return url
-    raise ValueError("webhook URL must be https:// (plain http:// only to localhost)")
+    raise ValueError("webhook URL must be https:// (plain http:// only to localhost, or set "
+                     "SHIPJACK_WEBHOOK_ALLOW_HTTP=1 on a private network)")
 
 
 def _http_send(url: str, body: bytes, headers: dict[str, str], timeout: float) -> int:
@@ -233,6 +235,7 @@ class Outbox:
     clock: Callable[[], float] = time.time
     queue: MemoryQueue | SqliteQueue | None = None
     lease_ttl: float = 30.0
+    allow_http: bool = False  # plain http to any host: only for a private network (containers)
     delivered: list[Delivery] = field(default_factory=list)  # what this process delivered
     dead: list[Delivery] = field(default_factory=list)       # what this process gave up on
     attempts_log: list[dict] = field(default_factory=list)
@@ -242,7 +245,7 @@ class Outbox:
     _thread: threading.Thread | None = field(default=None, repr=False)
 
     def __post_init__(self):
-        _check_url(self.url)
+        _check_url(self.url, self.allow_http)
         if len(self.secret) < MIN_SECRET_BYTES:
             raise ValueError(f"webhook secret must be at least {MIN_SECRET_BYTES} bytes")
 

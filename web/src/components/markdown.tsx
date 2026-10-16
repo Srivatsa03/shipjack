@@ -1,6 +1,6 @@
 import { Fragment, type ReactNode } from "react";
 
-// The little Markdown the models write: paragraphs, bullet and numbered lists, **bold** and `code`.
+// The little Markdown the models write: paragraphs, lists, tables, **bold** and `code`.
 // It builds React nodes, never HTML, so a model's text can't inject markup.
 function inline(text: string): ReactNode[] {
   const out: ReactNode[] = [];
@@ -36,6 +36,42 @@ export function Markdown({ text }: { text: string }) {
     }
     const bullet = /^\s*[-*•]\s+/;
     const numbered = /^\s*\d+[.)]\s+/;
+    const row = /^\s*\|.*\|/; // a trailing pipe is optional in Markdown tables
+    if (row.test(line) && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
+      // a table: header row, separator row, body rows
+      const cells = (l: string) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      const head = cells(line);
+      i += 2;
+      const body: string[][] = [];
+      while (i < lines.length && row.test(lines[i])) body.push(cells(lines[i++]));
+      blocks.push(
+        <div key={blocks.length} className="my-1 overflow-x-auto">
+          <table className="w-full text-left text-[14px]">
+            <thead className="text-label-2">
+              <tr>
+                {head.map((h, k) => (
+                  <th key={k} className="border-b border-white/15 py-1 pr-3 font-medium">
+                    {inline(h)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {body.map((r, k) => (
+                <tr key={k} className="border-b border-white/8 last:border-0">
+                  {r.map((c, j) => (
+                    <td key={j} className="py-1.5 pr-3 align-top">
+                      {inline(c)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      );
+      continue;
+    }
     if (bullet.test(line) || numbered.test(line)) {
       const ordered = numbered.test(line);
       const start = ordered ? parseInt(line.trim(), 10) : undefined; // a list split by a paragraph keeps counting

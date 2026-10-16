@@ -55,14 +55,21 @@ class Settings:
     schema: str = "assistant"
     purchase_ttl_s: float = 15 * 60                    # a purchase card can be approved for this long
     allow_imports: bool = True                         # catalog and document imports (off in the public demo)
+    demo: bool = False                                 # public demo: a private sandbox per visitor, daily caps
+    demo_calls_per_guest: int = 40                     # model calls per visitor per day
+    demo_calls_per_day: int = 600                      # model calls per day for the whole demo
+    demo_guests_per_ip_hour: int = 6
     sweep_every_s: float = 30.0
 
     @classmethod
     def from_env(cls) -> Settings:
         env = os.environ.get
-        return cls(db_url=env("SHIPJACK_ASSISTANT_DB") or env("SHIPJACK_DB", ""),
+        demo = env("SHIPJACK_DEMO", "") == "1"
+        return cls(db_url=env("SHIPJACK_ASSISTANT_DB") or env("SHIPJACK_DB", ""), demo=demo, allow_imports=not demo,
+                   demo_calls_per_guest=int(env("SHIPJACK_DEMO_CALLS_PER_GUEST", "40")),
+                   demo_calls_per_day=int(env("SHIPJACK_DEMO_CALLS_PER_DAY", "600")),
                    store_url=env("SHIPJACK_STORE_URL", cls.store_url),
-                   store_token=env("SHIPJACK_STORE_TOKEN", cls.store_token),
+                   store_token=env("SHIPJACK_STORE_TOKEN") or env("SHIPJACK_TOKEN", cls.store_token),
                    operator_token=env("SHIPJACK_OPERATOR_TOKEN", cls.operator_token),
                    webhook_secret=env("SHIPJACK_WEBHOOK_SECRET", "").encode(),
                    origins=[o for o in env("SHIPJACK_WEB_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
@@ -123,7 +130,7 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
         saver = AsyncPostgresSaver(pool)
         await saver.setup()
         db = AssistantDB(pool)
-        await db.setup()
+        await db.setup(seed=not settings.demo)  # the public demo has no shared, well-known tokens
         nonlocal deps
         if deps is None:
             deps = await _default_deps(settings, db)
@@ -159,9 +166,16 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
 
     async def own_thread(thread_id: str, u: dict) -> dict:
         thread = await db().thread(thread_id)
-        if thread is None or (thread["user_id"] != u["id"] and u["role"] != "operator"):
+        mine = thread is not None and (thread["user_id"] == u["id"] or
+                                       (u["role"] == "operator" and u.get("sandbox") in (None, thread["user_id"])))
+        if not mine:
             raise HTTPException(404, "no such thread")
         return thread
+
+    def client_ip(request: Request) -> str:
+        """The visitor's address. Behind the host's proxy it is the first X-Forwarded-For entry."""
+        forwarded = request.headers.get("x-forwarded-for", "")
+        return (forwarded.split(",")[0].strip() if forwarded else request.client.host if request.client else "?")[:64]
 
     # ---- running the graph ---------------------------------------------------------------------
     async def run(thread_id: str, payload: Any):
@@ -230,7 +244,17 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
     # ---- shopper routes ---------------------------------------------------------------------------
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "models": state["deps"].models.names if state.get("deps") else []}
+        return {"ok": True, "demo": settings.demo, "models": state["deps"].models.names if state.get("deps") else []}
+
+    @app.post("/api/demo/session", status_code=201)
+    async def demo_session(request: Request):
+        """Public demo: a private sandbox for this visitor (a shopper and that shopper's store console)."""
+        if not settings.demo:
+            raise HTTPException(404, "not a public demo")
+        ip = client_ip(request)
+        if await db().guests_from(ip) >= settings.demo_guests_per_ip_hour:
+            raise HTTPException(429, "Too many new demo sessions from this network. Try again in an hour.")
+        return await db().create_guest(ip)
 
     @app.get("/api/me")
     async def me(u: dict = Depends(user)):
@@ -273,6 +297,11 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
             raise HTTPException(400, "text must be 1 to 2000 characters")
         if not u.get("address"):
             raise HTTPException(400, "save a delivery address first")
+        if settings.demo:
+            if await db().model_calls_today(u["id"]) >= settings.demo_calls_per_guest:
+                raise HTTPException(429, "You've used today's demo turns. Come back tomorrow, or run shipjack locally.")
+            if await db().model_calls_today() >= settings.demo_calls_per_day:
+                raise HTTPException(429, "The demo has used today's model budget. Please try again tomorrow.")
         await db().touch(thread_id, title=text)
         profile = {k: u[k] for k in ("id", "name", "email", "address")}
         return stream(run(thread_id, {**make_messages(text), "user": profile}))
@@ -300,13 +329,17 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
 
     # ---- operator routes --------------------------------------------------------------------------
     @app.get("/api/ops/approvals")
-    async def ops_approvals(status: str | None = "pending", _: dict = Depends(operator)):
-        return await db().approvals(status=status or None, actor="operator")
+    async def ops_approvals(status: str | None = "pending", op: dict = Depends(operator)):
+        return await db().approvals(status=status or None, actor="operator", sandbox=op.get("sandbox"))
 
     @app.post("/api/ops/approvals/{approval_id}")
     async def ops_decide(approval_id: str, request: Request, op: dict = Depends(operator)):
         body = await request.json()
         approved, note = body.get("approved") is True, str(body.get("note", ""))
+        if op.get("sandbox"):
+            target = await db().approval(approval_id)
+            if target is None or target["user_id"] != op["sandbox"]:
+                raise HTTPException(404, "no such approval")
         found = await db().decide(approval_id, approved, op["id"], note)
         if found is None:
             raise HTTPException(409, "not pending (already decided, or no such approval)")
@@ -316,12 +349,14 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
         return JSONResponse({"id": approval_id, "status": "approved" if approved else "declined"}, status_code=202)
 
     @app.get("/api/ops/orders")
-    async def ops_orders(_: dict = Depends(operator)):
-        return await db().orders()
+    async def ops_orders(op: dict = Depends(operator)):
+        return await db().orders(user_id=op.get("sandbox"))
 
     @app.post("/api/ops/orders/{order_id}/{action}")
-    async def ops_order_action(order_id: str, action: str, request: Request, _: dict = Depends(operator)):
+    async def ops_order_action(order_id: str, action: str, request: Request, op: dict = Depends(operator)):
         from .store_client import StoreError
+        if op.get("sandbox") and await db().order_owner(order_id) != op["sandbox"]:
+            raise HTTPException(404, "no such order")
         client = state["deps"].store
         key = f"ops:{action}:{order_id}:{uuid.uuid4().hex[:8]}"
         try:
@@ -373,11 +408,12 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
                                                          key=f"doc:{uuid.uuid4().hex}"))
 
     @app.get("/api/ops/threads")
-    async def ops_threads(_: dict = Depends(operator)):
+    async def ops_threads(op: dict = Depends(operator)):
+        scope, args = (" WHERE t.user_id = %s", (op["sandbox"],)) if op.get("sandbox") else ("", ())
         return await db()._all("SELECT t.id, t.title, t.updated, u.name AS user_name, "
                                "(SELECT count(*) FROM events e WHERE e.thread_id = t.id AND e.event = 'model_call') "
-                               "AS model_calls FROM threads t JOIN users u ON u.id = t.user_id "
-                               "ORDER BY t.updated DESC LIMIT 100")
+                               "AS model_calls FROM threads t JOIN users u ON u.id = t.user_id" + scope +
+                               " ORDER BY t.updated DESC LIMIT 100", args)
 
     @app.get("/api/ops/metrics")
     async def ops_metrics(_: dict = Depends(operator)):

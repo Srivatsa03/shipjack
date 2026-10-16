@@ -1,5 +1,10 @@
-# Local development stack. Every port binds to 127.0.0.1 only.
-#   docker compose up -d db          # Postgres 17 with pgvector
+# The whole stack on one machine. Every port binds to 127.0.0.1 only.
+#
+#   export GROQ_API_KEY=...            # and/or GEMINI_API_KEY; read from your shell, never from a file
+#   docker compose --profile app up --build   # http://localhost:3000 (store console at /console)
+#
+# Just the database, for running the Python services from the source tree:
+#   docker compose up -d db
 services:
   db:
     image: pgvector/pgvector:pg17
@@ -18,6 +23,54 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  store:
+    build: .
+    profiles: [app]
+    command: ["sh", "-c", "shipjack-serve --host 0.0.0.0 --port 8000"]
+    environment:
+      SHIPJACK_DB: postgresql://shipjack:${SHIPJACK_PG_PASSWORD:-shipjack-dev}@db:5432/shipjack
+      SHIPJACK_WEBHOOK_URL: http://assistant:8200/api/webhooks/orders
+      SHIPJACK_WEBHOOK_ALLOW_HTTP: "1"   # the compose network is private
+      SHIPJACK_WEBHOOK_SECRET: ${SHIPJACK_WEBHOOK_SECRET:-local-only-webhook-secret-change-me-32b}
+      SHIPJACK_CATALOG: sample
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  assistant:
+    build: .
+    profiles: [app]
+    command: ["sh", "-c", "shipjack-assistant --host 0.0.0.0 --port 8200"]
+    environment:
+      SHIPJACK_DB: postgresql://shipjack:${SHIPJACK_PG_PASSWORD:-shipjack-dev}@db:5432/shipjack
+      SHIPJACK_STORE_URL: http://store:8000
+      SHIPJACK_WEBHOOK_SECRET: ${SHIPJACK_WEBHOOK_SECRET:-local-only-webhook-secret-change-me-32b}
+      SHIPJACK_WEB_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      SHIPJACK_DEMO: ${SHIPJACK_DEMO:-}
+      SHIPJACK_MODEL_PROVIDER: ${SHIPJACK_MODEL_PROVIDER:-gemini}
+      SHIPJACK_MODEL: ${SHIPJACK_MODEL:-gemini-3.8-flash}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    ports:
+      - "127.0.0.1:8200:8200"
+    depends_on:
+      db:
+        condition: service_healthy
+      store:
+        condition: service_started
+
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8200
+    profiles: [app]
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on: [assistant]
 
 volumes:
   pgdata:

@@ -29,7 +29,12 @@ CREATE TABLE IF NOT EXISTS events (seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMA
                                    node TEXT, data JSONB NOT NULL DEFAULT '{}');
 CREATE INDEX IF NOT EXISTS events_thread ON events (thread_id, seq);
 CREATE TABLE IF NOT EXISTS webhook_seen (signature TEXT PRIMARY KEY, request_id TEXT, t BIGINT NOT NULL);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS sandbox TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ip TEXT;
 """
+
+GUEST_ADDRESS = {"name": "Demo Shopper", "line_one": "1 Demo Way", "city": "Springfield", "state": "IL",
+                 "postal_code": "62701", "country": "US"}
 
 DEMO_USERS = [
     {"id": "u_sam", "name": "Sam Rivera", "email": "sam.rivera@example.com", "token": "demo-shopper",
@@ -72,7 +77,36 @@ class AssistantDB:
 
     # ---- users and threads -------------------------------------------------------------------
     async def user_by_token(self, token: str) -> dict | None:
-        return await self._one("SELECT id, name, email, address, role FROM users WHERE token = %s", (token,))
+        return await self._one("SELECT id, name, email, address, role, sandbox FROM users WHERE token = %s", (token,))
+
+    # ---- public demo: one private sandbox per visitor --------------------------------------------
+    async def create_guest(self, ip: str) -> dict:
+        """A shopper and an operator who sees only that shopper's chats and orders."""
+        import secrets
+        gid = f"g_{secrets.token_hex(6)}"
+        shopper, operator = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+        async with self.pool.connection() as conn:
+            await conn.execute("INSERT INTO users (id, name, email, address, token, role, sandbox, ip) VALUES "
+                               "(%s, %s, %s, %s, %s, 'shopper', %s, %s)",
+                               (gid, "Demo Shopper", f"{gid}@demo.shipjack.example", _j(GUEST_ADDRESS), shopper, gid, ip))
+            await conn.execute("INSERT INTO users (id, name, email, token, role, sandbox, ip) VALUES "
+                               "(%s, %s, %s, %s, 'operator', %s, %s)",
+                               (f"{gid}_ops", "Store operator (your sandbox)", f"{gid}-ops@demo.shipjack.example",
+                                operator, gid, ip))
+        return {"shopper_token": shopper, "operator_token": operator, "user_id": gid}
+
+    async def guests_from(self, ip: str, hours: float = 1.0) -> int:
+        row = await self._one("SELECT count(*) AS n FROM users WHERE ip = %s AND role = 'shopper' AND "
+                              "created > now() - make_interval(secs => %s)", (ip, hours * 3600))
+        return row["n"] if row else 0
+
+    async def model_calls_today(self, user_id: str | None = None) -> int:
+        """Model calls since midnight UTC, for one user's threads or for everyone."""
+        sql = ("SELECT count(*) AS n FROM events e" + (" JOIN threads t ON t.id = e.thread_id AND t.user_id = %s"
+                                                         if user_id else "") +
+               " WHERE e.event = 'model_call' AND e.ts >= date_trunc('day', now() AT TIME ZONE 'utc') AT TIME ZONE 'utc'")
+        row = await self._one(sql, (user_id,) if user_id else ())
+        return row["n"] if row else 0
 
     async def set_address(self, user_id: str, address: dict) -> None:
         await self._run("UPDATE users SET address = %s WHERE id = %s", (_j(address), user_id))
@@ -102,12 +136,15 @@ class AssistantDB:
                         (approval_id, thread_id, payload.get("kind", "?"), payload.get("actor", "?"), _j(payload)))
 
     async def approvals(self, status: str | None = None, actor: str | None = None,
-                        thread_id: str | None = None) -> list[dict]:
+                        thread_id: str | None = None, sandbox: str | None = None) -> list[dict]:
         where, args = [], []
         for col, val in (("status", status), ("actor", actor), ("thread_id", thread_id)):
             if val:
                 where.append(f"{col} = %s")
                 args.append(val)
+        if sandbox:
+            where.append("thread_id IN (SELECT id FROM threads WHERE user_id = %s)")
+            args.append(sandbox)
         sql = ("SELECT id, thread_id, kind, actor, payload, status, decided_by, note, created, decided FROM approvals"
                + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created DESC LIMIT 200")
         return await self._all(sql, tuple(args))
@@ -135,6 +172,14 @@ class AssistantDB:
 
     async def order_ids(self, user_id: str) -> list[str]:
         return [r["id"] for r in await self._all("SELECT id FROM orders WHERE user_id = %s ORDER BY created", (user_id,))]
+
+    async def approval(self, approval_id: str) -> dict | None:
+        return await self._one("SELECT a.id, a.thread_id, a.kind, a.actor, a.status, t.user_id FROM approvals a "
+                               "JOIN threads t ON t.id = a.thread_id WHERE a.id = %s", (approval_id,))
+
+    async def order_owner(self, order_id: str) -> str | None:
+        row = await self._one("SELECT user_id FROM orders WHERE id = %s", (order_id,))
+        return row["user_id"] if row else None
 
     async def orders(self, user_id: str | None = None, thread_id: str | None = None) -> list[dict]:
         where, args = [], []

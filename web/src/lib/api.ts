@@ -1,7 +1,57 @@
-// The assistant API (shipjack/assistant/api.py). Demo tokens stand in for sign-in.
+// The assistant API (shipjack/assistant/api.py).
 export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8200";
-export const SHOPPER_TOKEN = process.env.NEXT_PUBLIC_SHOPPER_TOKEN ?? "demo-shopper";
-export const OPERATOR_TOKEN = process.env.NEXT_PUBLIC_OPERATOR_TOKEN ?? "demo-operator";
+
+// Who is calling. Locally, the API's fixed demo tokens. In the public demo, each browser asks for its
+// own sandbox once (a shopper and that shopper's store console) and keeps the tokens in localStorage.
+type Role = "shopper" | "operator";
+type Session = { shopper: string; operator: string; demo: boolean };
+const KEY = "shipjack.session.v1";
+let pending: Promise<Session> | null = null;
+
+function saved(): Session | null {
+  try {
+    const raw = localStorage.getItem(KEY);
+    return raw ? (JSON.parse(raw) as Session) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function session(): Promise<Session> {
+  const known = saved();
+  if (known) return Promise.resolve(known);
+  pending ??= (async () => {
+    const health = await fetch(`${API}/api/health`).then((r) => r.json());
+    if (!health.demo) {
+      return {
+        shopper: process.env.NEXT_PUBLIC_SHOPPER_TOKEN ?? "demo-shopper",
+        operator: process.env.NEXT_PUBLIC_OPERATOR_TOKEN ?? "demo-operator",
+        demo: false,
+      };
+    }
+    const res = await fetch(`${API}/api/demo/session`, { method: "POST" });
+    const body = await res.json();
+    if (!res.ok) throw new ApiError(res.status, body.detail ?? "Couldn't start a demo session.");
+    const made = { shopper: body.shopper_token, operator: body.operator_token, demo: true };
+    try {
+      localStorage.setItem(KEY, JSON.stringify(made));
+    } catch {
+      // without storage the sandbox lasts until the page reloads
+    }
+    return made;
+  })().finally(() => {
+    pending = null;
+  });
+  return pending;
+}
+
+export function forgetSession() {
+  try {
+    localStorage.removeItem(KEY);
+  } catch {
+    // nothing to forget
+  }
+}
 
 export type Address = {
   name: string;
@@ -95,11 +145,17 @@ export class ApiError extends Error {
   }
 }
 
-async function call<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
+async function call<T>(path: string, role: Role, init: RequestInit = {}, retry = true): Promise<T> {
+  const s = await session();
+  const token = s[role];
   const res = await fetch(`${API}${path}`, {
     ...init,
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...(init.headers ?? {}) },
   });
+  if (res.status === 401 && s.demo && retry) {
+    forgetSession(); // the demo's sandbox was reset on the server: start a new one
+    return call<T>(path, role, init, false);
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new ApiError(res.status, body.detail ?? body.message ?? `Request failed (${res.status})`);
@@ -108,16 +164,16 @@ async function call<T>(path: string, token: string, init: RequestInit = {}): Pro
 }
 
 export const shopper = {
-  me: () => call<User>("/api/me", SHOPPER_TOKEN),
-  saveAddress: (a: Address) => call<User>("/api/me/address", SHOPPER_TOKEN, { method: "PUT", body: JSON.stringify(a) }),
-  threads: () => call<Thread[]>("/api/threads", SHOPPER_TOKEN),
-  newThread: () => call<Thread>("/api/threads", SHOPPER_TOKEN, { method: "POST" }),
-  thread: (id: string) => call<ThreadView>(`/api/threads/${id}`, SHOPPER_TOKEN),
-  orders: () => call<OrderRow[]>("/api/orders", SHOPPER_TOKEN),
+  me: () => call<User>("/api/me", "shopper"),
+  saveAddress: (a: Address) => call<User>("/api/me/address", "shopper", { method: "PUT", body: JSON.stringify(a) }),
+  threads: () => call<Thread[]>("/api/threads", "shopper"),
+  newThread: () => call<Thread>("/api/threads", "shopper", { method: "POST" }),
+  thread: (id: string) => call<ThreadView>(`/api/threads/${id}`, "shopper"),
+  orders: () => call<OrderRow[]>("/api/orders", "shopper"),
   send: (id: string, text: string, onEvent: (e: StreamEvent) => void, signal?: AbortSignal) =>
-    stream(`/api/threads/${id}/messages`, SHOPPER_TOKEN, { text }, onEvent, signal),
+    stream(`/api/threads/${id}/messages`, "shopper", { text }, onEvent, signal),
   decide: (id: string, approvalId: string, approved: boolean, onEvent: (e: StreamEvent) => void) =>
-    stream(`/api/threads/${id}/decision`, SHOPPER_TOKEN, { approval_id: approvalId, approved }, onEvent),
+    stream(`/api/threads/${id}/decision`, "shopper", { approval_id: approvalId, approved }, onEvent),
 };
 
 export type Metrics = {
@@ -151,33 +207,33 @@ export type Approval = {
 export type OpsThread = { id: string; title: string; updated: string; user_name: string; model_calls: number };
 
 export const operator = {
-  approvals: (status = "pending") => call<Approval[]>(`/api/ops/approvals?status=${status}`, OPERATOR_TOKEN),
+  approvals: (status = "pending") => call<Approval[]>(`/api/ops/approvals?status=${status}`, "operator"),
   decide: (id: string, approved: boolean, note: string) =>
-    call<{ id: string; status: string }>(`/api/ops/approvals/${id}`, OPERATOR_TOKEN, {
+    call<{ id: string; status: string }>(`/api/ops/approvals/${id}`, "operator", {
       method: "POST",
       body: JSON.stringify({ approved, note }),
     }),
-  orders: () => call<OrderRow[]>("/api/ops/orders", OPERATOR_TOKEN),
+  orders: () => call<OrderRow[]>("/api/ops/orders", "operator"),
   act: (orderId: string, action: "ship" | "deliver", body: Record<string, string> = {}) =>
-    call<AcpOrder>(`/api/ops/orders/${orderId}/${action}`, OPERATOR_TOKEN, {
+    call<AcpOrder>(`/api/ops/orders/${orderId}/${action}`, "operator", {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  threads: () => call<OpsThread[]>("/api/ops/threads", OPERATOR_TOKEN),
-  thread: (id: string) => call<ThreadView>(`/api/threads/${id}`, OPERATOR_TOKEN),
-  events: (id: string) => call<StoredEvent[]>(`/api/threads/${id}/events`, OPERATOR_TOKEN),
-  metrics: () => call<Metrics>("/api/ops/metrics", OPERATOR_TOKEN),
-  knowledge: () => call<Knowledge>("/api/ops/knowledge", OPERATOR_TOKEN),
+  threads: () => call<OpsThread[]>("/api/ops/threads", "operator"),
+  thread: (id: string) => call<ThreadView>(`/api/threads/${id}`, "operator"),
+  events: (id: string) => call<StoredEvent[]>(`/api/threads/${id}/events`, "operator"),
+  metrics: () => call<Metrics>("/api/ops/metrics", "operator"),
+  knowledge: () => call<Knowledge>("/api/ops/knowledge", "operator"),
   search: (q: string, kind: string, mode: string) =>
     call<{ data: KbHit[]; vector: boolean }>(
       `/api/ops/knowledge/search?${new URLSearchParams({ q, ...(kind ? { kind } : {}), ...(mode ? { mode } : {}) })}`,
-      OPERATOR_TOKEN,
+      "operator",
     ),
-  sampleCatalog: () => call<{ name: string; csv: string }>("/api/ops/sample-catalog", OPERATOR_TOKEN),
+  sampleCatalog: () => call<{ name: string; csv: string }>("/api/ops/sample-catalog", "operator"),
   importCatalog: (csv: string) =>
-    call<CatalogResult>("/api/ops/catalog", OPERATOR_TOKEN, { method: "POST", body: JSON.stringify({ csv }) }),
+    call<CatalogResult>("/api/ops/catalog", "operator", { method: "POST", body: JSON.stringify({ csv }) }),
   addDocument: (slug: string, markdown: string) =>
-    call<{ slug: string; chunks: number; seconds: number }>("/api/ops/documents", OPERATOR_TOKEN, {
+    call<{ slug: string; chunks: number; seconds: number }>("/api/ops/documents", "operator", {
       method: "POST",
       body: JSON.stringify({ slug, markdown }),
     }),
@@ -205,11 +261,12 @@ export type CatalogResult = { format: string; imported: number; indexed: number;
 // reads the response stream and splits it into events itself.
 async function stream(
   path: string,
-  token: string,
+  role: Role,
   body: unknown,
   onEvent: (e: StreamEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
+  const token = (await session())[role];
   const res = await fetch(`${API}${path}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "text/event-stream" },

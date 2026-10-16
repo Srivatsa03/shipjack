@@ -364,7 +364,7 @@ def _respond(request: Request, code: int, payload: Any, headers: dict) -> JSONRe
 
 
 def demo_app(token: str = "demo-token", *, stripe: bool = False, operator_token: str = "demo-operator",
-             webhook_url: str | None = None, db: str | None = None) -> FastAPI:
+             webhook_url: str | None = None, db: str | None = None, catalog: str | None = None) -> FastAPI:
     """A ready-to-run store (Northwind) with one demo platform token, for ``shipjack-serve``.
 
     With ``stripe=True`` the money settles through Stripe test mode (needs STRIPE_TEST_KEY and the
@@ -381,10 +381,18 @@ def demo_app(token: str = "demo-token", *, stripe: bool = False, operator_token:
         processor = StripeProcessor.from_env()
     outbox = None
     if webhook_url:
+        import os
+
         from .webhooks import Outbox, secret_from_env
-        outbox = Outbox(webhook_url, secret_from_env())
+        outbox = Outbox(webhook_url, secret_from_env(), allow_http=os.environ.get("SHIPJACK_WEBHOOK_ALLOW_HTTP") == "1")
     world = build(stores(), processor=processor, db=db)
     merchant = world.merchants["northwind"]
+    if catalog == "sample" and merchant.repo.catalog() is None:  # seed a new store with the sample export
+        from importlib import resources
+
+        from .onboarding import parse_catalog
+        merchant.replace_catalog(parse_catalog(
+            resources.files("shipjack").joinpath("data/northwind_shopify_export.csv").read_text()).products)
     app = create_app(merchant, {token: "demo-agent-platform"}, operators={operator_token: "demo-operator"})
     app.state.world = world
     app.state.outbox = outbox.attach(merchant).start() if outbox else None
@@ -397,7 +405,8 @@ def app_from_env() -> FastAPI:
     env = os.environ.get
     return demo_app(env("SHIPJACK_TOKEN", "demo-token"), stripe=env("SHIPJACK_STRIPE") == "1",
                     operator_token=env("SHIPJACK_OPERATOR_TOKEN", "demo-operator"),
-                    webhook_url=env("SHIPJACK_WEBHOOK_URL") or None, db=env("SHIPJACK_DB") or None)
+                    webhook_url=env("SHIPJACK_WEBHOOK_URL") or None, db=env("SHIPJACK_DB") or None,
+                    catalog=env("SHIPJACK_CATALOG") or None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -406,7 +415,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="shipjack-serve", description="Run the demo agent-ready store over HTTP.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--token", default="demo-token", help="the bearer token an agent platform presents")
+    parser.add_argument("--token", default=None,
+                        help="the bearer token an agent platform presents (default: SHIPJACK_TOKEN, else demo-token)")
     parser.add_argument("--stripe", action="store_true", help="settle through Stripe test mode (needs STRIPE_TEST_KEY)")
     parser.add_argument("--webhook-url", help="send signed ACP order events here (secret: SHIPJACK_WEBHOOK_SECRET)")
     parser.add_argument("--db", help="keep the store's state in a SQLite file or a postgresql:// URL (or set SHIPJACK_DB)")
@@ -424,7 +434,8 @@ def main(argv: list[str] | None = None) -> int:
         print("shipjack-serve needs uvicorn: pip install 'shipjack[serve]'", file=sys.stderr)
         return 2
     import os
-    os.environ.update({"SHIPJACK_TOKEN": args.token, "SHIPJACK_STRIPE": "1" if args.stripe else "",
+    os.environ.update({"SHIPJACK_TOKEN": args.token or os.environ.get("SHIPJACK_TOKEN", "demo-token"),
+                       "SHIPJACK_STRIPE": "1" if args.stripe else "",
                        "SHIPJACK_WEBHOOK_URL": args.webhook_url or os.environ.get("SHIPJACK_WEBHOOK_URL", ""),
                        "SHIPJACK_DB": args.db or os.environ.get("SHIPJACK_DB", "")})
     args.db = os.environ["SHIPJACK_DB"] or None

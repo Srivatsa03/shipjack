@@ -144,8 +144,8 @@ class StoreMCP:
         http = httpx.AsyncClient(headers={"Authorization": f"Bearer {self.token}"}, timeout=15,
                                  transport=self.transport)
         try:
-            async with http, streamable_http_client(self.url, http_client=http) as (read, write, _), \
-                    ClientSession(read, write) as session:
+            async with http, streamable_http_client(self.url, http_client=http) as streams, \
+                    ClientSession(streams[0], streams[1]) as session:  # 1.x yields 3 values, 2.x yields 2
                 await session.initialize()
                 result = await session.call_tool(tool, args)
         except StoreError:
@@ -153,7 +153,10 @@ class StoreMCP:
         except Exception as exc:  # the MCP client wraps transport failures in several types
             raise StoreError("unreachable", f"store MCP server unreachable: {type(exc).__name__}") from None
         body = json.loads(result.content[0].text) if result.content else {}
-        if result.isError:
+        failed = getattr(result, "is_error", None)  # MCP 2.x
+        if failed is None:
+            failed = getattr(result, "isError", False)  # MCP 1.x
+        if failed:
             raise StoreError(body.get("code", "error"), body.get("message", "tool error"))
         return body
 

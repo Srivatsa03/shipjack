@@ -2,18 +2,20 @@
 
 import { ArrowUp, Clock, LayoutGrid, PanelLeft, Plus, Truck, X } from "lucide-react";
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { LiquidLens } from "@/components/liquid-lens";
 import { Markdown } from "@/components/markdown";
 import { useWallpaper, WALLPAPERS } from "@/components/wallpaper";
 import {
   API,
   ApiError,
+  forgetSession,
   money,
   type Message,
   type OrderRow,
   type PurchaseCard,
   type RefundAsk,
+  session,
   shopper,
   type StreamEvent,
   type Thread,
@@ -22,7 +24,7 @@ import {
 } from "@/lib/api";
 import { AgentTrail, type Step, stepFor } from "./agent-trail";
 import { ApprovalSheet } from "./approval-sheet";
-import { parseProducts, type Product, Products } from "./products";
+import { mentioned, parseProducts, type Product, Products } from "./products";
 
 const SUGGESTIONS = [
   "Find me a USB-C hub with HDMI under $40",
@@ -43,6 +45,8 @@ export function ShopperApp() {
   const [error, setError] = useState<string | null>(null);
   const [orders, setOrders] = useState<OrderRow[]>([]);
   const [models, setModels] = useState<string[]>([]);
+  const [demo, setDemo] = useState(false);
+  const [waking, setWaking] = useState(false);
   const [draft, setDraft] = useState("");
   const [sidebar, setSidebar] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
@@ -60,16 +64,26 @@ export function ShopperApp() {
   }, []);
 
   useEffect(() => {
+    const slow = window.setTimeout(() => setWaking(true), 2500); // free hosting sleeps when idle
     (async () => {
       try {
+        setDemo((await session()).demo);
         setMe(await shopper.me());
         await refreshLists();
         const health = await fetch(`${API}/api/health`).then((r) => r.json());
         setModels(health.models ?? []);
-      } catch {
-        setError(`The assistant isn't reachable at ${API}. Start it with shipjack-assistant.`);
+      } catch (err) {
+        setError(
+          err instanceof ApiError
+            ? err.message
+            : `The assistant isn't reachable at ${API}. Start it with shipjack-assistant.`,
+        );
+      } finally {
+        window.clearTimeout(slow);
+        setWaking(false);
       }
     })();
+    return () => window.clearTimeout(slow);
   }, [refreshLists]);
 
   const remember = (id: string | null) => {
@@ -180,6 +194,16 @@ export function ShopperApp() {
   const refund = view?.pending.find((p): p is RefundAsk => p.kind === "refund");
   const messages = view?.messages ?? [];
   const lastUser = messages.map((m) => m.role).lastIndexOf("user");
+  // search results: the products the turn's answer talks about, each shown once per turn
+  const productsAt = new Map<number, Product[]>();
+  let seen = new Set<string>();
+  messages.forEach((m, i) => {
+    if (m.role === "user") seen = new Set();
+    if (m.role !== "tool" || m.name !== "search_products") return;
+    const fresh = mentioned(parseProducts(m.content), finalReply(messages, i)).filter((p) => !seen.has(p.id));
+    fresh.forEach((p) => seen.add(p.id));
+    if (fresh.length) productsAt.set(i, fresh);
+  });
   // each order's card sits under the latest assistant message that mentions it, once
   const cardAt = new Map<number, OrderRow[]>();
   for (const o of view?.orders ?? []) {
@@ -267,6 +291,19 @@ export function ShopperApp() {
             </div>
           )}
           <WallpaperPicker />
+          {demo && (
+            <button
+              type="button"
+              onClick={() => {
+                forgetSession();
+                window.history.replaceState(null, "", "/");
+                window.location.reload(); // a clean start: new sandbox, no state carried over
+              }}
+              className="mt-2 px-1.5 text-[12.5px] text-label-3 underline-offset-2 hover:text-label hover:underline"
+            >
+              Start over with a new sandbox
+            </button>
+          )}
         </footer>
       </aside>
 
@@ -301,10 +338,15 @@ export function ShopperApp() {
 
         <div ref={scroller} className="thin-scroll h-full overflow-y-auto">
           <div className="mx-auto flex min-h-full max-w-[760px] flex-col gap-3 px-4 pt-24 pb-48">
-            {!view && !running && <Welcome name={me?.name} onPick={send} />}
+            {waking && (
+              <p role="status" className="glass self-center rounded-full px-4 py-2 text-[13.5px] text-label-2">
+                Waking the demo server. Free hosting sleeps when idle, so this can take up to a minute.
+              </p>
+            )}
+            {!view && !running && <Welcome name={me?.name} demo={demo} onPick={send} />}
 
             {messages.map((m, i) => (
-              <MessageItem key={m.id + i} m={m} orders={cardAt.get(i) ?? []} onPick={pick}>
+              <MessageItem key={m.id + i} m={m} products={productsAt.get(i) ?? []} orders={cardAt.get(i) ?? []} onPick={pick}>
                 {i === lastUser && live && live.steps.length > 0 && (
                   <div className="pt-1">
                     <AgentTrail steps={live.steps} running={running} />
@@ -398,16 +440,32 @@ export function ShopperApp() {
   );
 }
 
-function Welcome({ name, onPick }: { name?: string; onPick: (t: string) => void }) {
+// The answer that closed the turn a message belongs to: the last assistant text before the next user message.
+function finalReply(messages: Message[], from: number): string | undefined {
+  let reply: string | undefined;
+  for (const n of messages.slice(from + 1)) {
+    if (n.role === "user") break;
+    if (n.role === "assistant" && n.content.trim()) reply = n.content;
+  }
+  return reply;
+}
+
+function Welcome({ name, demo, onPick }: { name?: string; demo: boolean; onPick: (t: string) => void }) {
   return (
     <section className="flex flex-1 flex-col items-center justify-center pb-10 text-center">
       <h1 className="text-[34px] leading-tight font-semibold tracking-tight [text-shadow:0_2px_24px_rgb(0_0_0/0.45)] sm:text-[44px]">
-        {name ? `Hi ${name.split(" ")[0]}. What do you need?` : "What do you need?"}
+        {name && !demo ? `Hi ${name.split(" ")[0]}. What do you need?` : "What do you need?"}
       </h1>
       <p className="mt-3 max-w-[460px] text-[16px] text-label-2 [text-shadow:0_1px_12px_rgb(0_0_0/0.5)]">
         I can find products at Northwind and buy them for you. You approve every payment, and it ships only to your saved
         address.
       </p>
+      {demo && (
+        <p className="mt-2 max-w-[460px] text-[13.5px] text-label-3 [text-shadow:0_1px_12px_rgb(0_0_0/0.5)]">
+          This is a public demo: a made-up store, test payments, and a private sandbox for this browser. The store console
+          shows only your sandbox.
+        </p>
+      )}
       <ul className="mt-8 flex max-w-[620px] flex-wrap justify-center gap-2">
         {SUGGESTIONS.map((s) => (
           <li key={s}>
@@ -423,16 +481,17 @@ function Welcome({ name, onPick }: { name?: string; onPick: (t: string) => void 
 
 function MessageItem({
   m,
+  products,
   orders,
   onPick,
   children,
 }: {
   m: Message;
+  products: Product[];
   orders: OrderRow[];
   onPick: (p: Product) => void;
   children?: React.ReactNode;
 }) {
-  const products = useMemo(() => (m.role === "tool" && m.name === "search_products" ? parseProducts(m.content) : []), [m]);
   if (m.role === "user") {
     return (
       <div className="flex flex-col items-end gap-2">
@@ -443,9 +502,10 @@ function MessageItem({
   }
   if (m.role === "tool") return products.length ? <Products items={products} onPick={onPick} /> : null;
   if (!m.content.trim()) return null;
+  const wide = /^\s*\|.*\|/m.test(m.content); // a table needs the room
   return (
     <div className="flex flex-col items-start gap-2">
-      <div className="glass max-w-[88%] rounded-[22px] rounded-bl-[8px] px-4 py-2.5">
+      <div className={"glass rounded-[22px] rounded-bl-[8px] px-4 py-2.5 " + (wide ? "w-full" : "max-w-[88%]")}>
         <Markdown text={m.content} />
       </div>
       {orders.map((o) => (

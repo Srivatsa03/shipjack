@@ -523,3 +523,11 @@ def test_the_demo_store_needs_the_secret_for_webhooks(monkeypatch):
     monkeypatch.delenv(webhooks.SECRET_ENV, raising=False)
     with pytest.raises(ValueError, match="SHIPJACK_WEBHOOK_SECRET"):
         demo_app(webhook_url="http://127.0.0.1:9/hook")
+
+
+def test_plain_http_to_another_host_needs_an_explicit_private_network():
+    with pytest.raises(ValueError, match="SHIPJACK_WEBHOOK_ALLOW_HTTP"):
+        Outbox("http://assistant:8200/hook", SECRET)
+    assert Outbox("http://assistant:8200/hook", SECRET, allow_http=True)
+    with pytest.raises(ValueError):
+        Outbox("ftp://assistant/hook", SECRET, allow_http=True)
