@@ -161,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
     add_load(sub)
     from .retrieval_eval import add_parser as add_retrieval
     add_retrieval(sub)
+    from .vectors import add_parser as add_vectors
+    add_vectors(sub)
     args = p.parse_args(argv)
     return args.func(args)
 

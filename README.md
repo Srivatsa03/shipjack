@@ -152,6 +152,11 @@ refused before anything is signed.
 
 Proposed upstream as [AP2 issue #381](https://github.com/google-agentic-commerce/AP2/issues/381).
 
+The same cases as authority vectors, in the two-record format of AP2 Discussion
+[#332](https://github.com/google-agentic-commerce/AP2/discussions/332) (what the SDK evaluates, and what
+the spec establishes), run against the SDK by `shipjack ap2-vectors`:
+[docs/AP2_FULFILLMENT_VECTORS.md](docs/AP2_FULFILLMENT_VECTORS.md).
+
 ## With real models
 
 `shipjack llm-bench` puts a real model in the agent's seat. Each trial runs the three payment

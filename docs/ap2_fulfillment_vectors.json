@@ -1,0 +1,176 @@
+{
+ "format": "two records per vector: sdk = what the SDK evaluates; authority = what the spec establishes",
+ "ap2_sdk_commit": "e1ea56d",
+ "spec": "docs/ap2/agent_authorization.md",
+ "shared_set": "AP2 Discussion #332 (C0-C4b)",
+ "vectors": [
+  {
+   "id": "F1",
+   "case": "C4b",
+   "stage": "before the closed mandate is signed (open -> closed)",
+   "title": "Physical goods ship to an address the user never gave",
+   "open_mandate": "checkout.allowed_merchants = [northwind], checkout.line_items = [nw-hub-7 x1]",
+   "users_destination": "1200 W Harrison St, Chicago",
+   "sdk": {
+    "chain_signatures_aud_nonce": "verified",
+    "chain_parse": "ok",
+    "open_mandate_constraints": [
+     "checkout.allowed_merchants",
+     "checkout.line_items"
+    ],
+    "destination_in_signed_checkout": true,
+    "destination_is_a_checkout_model_field": false,
+    "expected_checkout_hash_passed": true,
+    "violations": [],
+    "result": "no violations"
+   },
+   "checkout_destination": "77 Dock St, Gary",
+   "authority": {
+    "status": "NORMATIVE_QUESTION",
+    "basis": "docs/ap2/agent_authorization.md makes constraints OPTIONAL and evaluates the constraints present in the open mandate; the v0.2 checkout vocabulary (checkout.allowed_merchants, checkout.line_items) has no type for the destination, and no text says whether the agent's choice of destination was delegated."
+   }
+  },
+  {
+   "id": "F2",
+   "case": "C4b",
+   "stage": "before the closed mandate is signed (open -> closed)",
+   "title": "A digital good (gift card code) is emailed to an inbox the user never gave",
+   "open_mandate": "checkout.allowed_merchants = [northwind], checkout.line_items = [nw-gift-25 x1]",
+   "users_destination": "sam.rivera@example.com",
+   "sdk": {
+    "chain_signatures_aud_nonce": "verified",
+    "chain_parse": "ok",
+    "open_mandate_constraints": [
+     "checkout.allowed_merchants",
+     "checkout.line_items"
+    ],
+    "destination_in_signed_checkout": true,
+    "destination_is_a_checkout_model_field": false,
+    "expected_checkout_hash_passed": true,
+    "violations": [],
+    "result": "no violations"
+   },
+   "checkout_destination": "codes@northwind-fulfillment.example",
+   "authority": {
+    "status": "NORMATIVE_QUESTION",
+    "basis": "docs/ap2/agent_authorization.md makes constraints OPTIONAL and evaluates the constraints present in the open mandate; the v0.2 checkout vocabulary (checkout.allowed_merchants, checkout.line_items) has no type for the destination, and no text says whether the agent's choice of destination was delegated."
+   }
+  },
+  {
+   "id": "F3",
+   "case": "F1 + experimental constraint",
+   "stage": "before the closed mandate is signed (open -> closed)",
+   "title": "F1 with io.github.srivatsa03.fulfillment {ship_to: [the user's address]} in the open mandate",
+   "open_mandate": "F1's constraints + io.github.srivatsa03.fulfillment",
+   "users_destination": "1200 W Harrison St, Chicago",
+   "checkout_destination": "77 Dock St, Gary",
+   "attacker_destination": {
+    "sdk_unmodified": {
+     "chain_signatures_aud_nonce": "verified",
+     "chain_parse": "rejected: ValidationError (constraint types not in the SDK model: ['io.github.srivatsa03.fulfillment'])",
+     "result": "fails closed (C0: an unknown constraint fails evaluation)"
+    },
+    "sdk_plus_fulfillment_evaluator": {
+     "violations": [
+      "fulfillment: ship-to 77 Dock St, Gary is not allowed"
+     ],
+     "result": "violations"
+    }
+   },
+   "users_own_destination": {
+    "sdk_unmodified": {
+     "chain_signatures_aud_nonce": "verified",
+     "chain_parse": "rejected: ValidationError (constraint types not in the SDK model: ['io.github.srivatsa03.fulfillment'])",
+     "result": "fails closed (C0: an unknown constraint fails evaluation)"
+    },
+    "sdk_plus_fulfillment_evaluator": {
+     "violations": [],
+     "result": "no violations"
+    }
+   },
+   "authority": {
+    "status": "C3 where the type is implemented; C0 where it is not",
+    "basis": "With the constraint present the destination is a declared dimension, so a false value is an authority violation (C3) for a verifier that implements the type. A verifier that does not know it MUST fail it (docs/ap2/agent_authorization.md, Verification and Processing Rules, step 3). The type is experimental (AP2 #381), not part of AP2."
+   }
+  },
+  {
+   "id": "F4",
+   "case": "F2 + experimental constraint",
+   "stage": "before the closed mandate is signed (open -> closed)",
+   "title": "F2 with io.github.srivatsa03.fulfillment {deliver_to: [the user's email]} in the open mandate",
+   "open_mandate": "F2's constraints + io.github.srivatsa03.fulfillment",
+   "users_destination": "sam.rivera@example.com",
+   "checkout_destination": "codes@northwind-fulfillment.example",
+   "attacker_destination": {
+    "sdk_unmodified": {
+     "chain_signatures_aud_nonce": "verified",
+     "chain_parse": "rejected: ValidationError (constraint types not in the SDK model: ['io.github.srivatsa03.fulfillment'])",
+     "result": "fails closed (C0: an unknown constraint fails evaluation)"
+    },
+    "sdk_plus_fulfillment_evaluator": {
+     "violations": [
+      "fulfillment: delivery email codes@northwind-fulfillment.example is not allowed"
+     ],
+     "result": "violations"
+    }
+   },
+   "users_own_destination": {
+    "sdk_unmodified": {
+     "chain_signatures_aud_nonce": "verified",
+     "chain_parse": "rejected: ValidationError (constraint types not in the SDK model: ['io.github.srivatsa03.fulfillment'])",
+     "result": "fails closed (C0: an unknown constraint fails evaluation)"
+    },
+    "sdk_plus_fulfillment_evaluator": {
+     "violations": [],
+     "result": "no violations"
+    }
+   },
+   "authority": {
+    "status": "C3 where the type is implemented; C0 where it is not",
+    "basis": "As F3."
+   }
+  },
+  {
+   "id": "F5",
+   "case": "C1",
+   "stage": "after the closed mandate is signed (closed -> execution)",
+   "title": "The address changes after the closed mandate bound the checkout",
+   "open_mandate": "as F1",
+   "users_destination": "1200 W Harrison St, Chicago",
+   "bound_checkout_destination": "1200 W Harrison St, Chicago",
+   "presented_checkout_destination": "77 Dock St, Gary",
+   "sdk_caller_passes_no_expected_hash": {
+    "chain_signatures_aud_nonce": "verified",
+    "chain_parse": "ok",
+    "open_mandate_constraints": [
+     "checkout.allowed_merchants",
+     "checkout.line_items"
+    ],
+    "destination_in_signed_checkout": true,
+    "destination_is_a_checkout_model_field": false,
+    "expected_checkout_hash_passed": false,
+    "violations": [],
+    "result": "no violations"
+   },
+   "sdk_hash_derived_from_presented_checkout": {
+    "chain_signatures_aud_nonce": "verified",
+    "chain_parse": "ok",
+    "open_mandate_constraints": [
+     "checkout.allowed_merchants",
+     "checkout.line_items"
+    ],
+    "destination_in_signed_checkout": true,
+    "destination_is_a_checkout_model_field": false,
+    "expected_checkout_hash_passed": true,
+    "violations": [
+     "Checkout checkout_hash mismatch: expected <sha256>, got <sha256>"
+    ],
+    "result": "violations"
+   },
+   "authority": {
+    "status": "established for this draft: integrity failure, MUST reject (C1)",
+    "basis": "The destination is part of the merchant-signed checkout the closed mandate hashes, so a changed destination is a different checkout. In the SDK at this commit the hash is compared only when the caller passes expected_checkout_hash (AP2 #358; #359 derives it from the presented checkout_jwt). Not a C4b question."
+   }
+  }
+ ]
+}

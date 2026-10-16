@@ -14,6 +14,10 @@
   meaning on pgvector (vector, keyword or weighted hybrid), MCP `search_store_docs`, a retrieval eval
   (`shipjack retrieval-eval`, docs/RETRIEVAL.md). Orders keep the lines they were sold with.
 - **Postgres store backend** with the same guarantees as SQLite (advisory lock), tested in CI.
+- **AP2 authority vectors for the fulfillment destination** (`shipjack ap2-vectors`,
+  docs/AP2_FULFILLMENT_VECTORS.md): five cases in the two-record format of AP2 Discussion #332, run
+  against the SDK at e1ea56d: a redirected ship-to and deliver-to (C4b), the same with the proposed
+  fulfillment constraint, and a destination changed after the closed mandate was signed (C1, #358).
 - **MCP over Streamable HTTP** at the store's `POST /mcp`.
 - **Deployment**: a public demo mode (sandboxes, caps, no shared tokens), Dockerfiles, docker compose
   for the whole stack, a Render blueprint, docs/DEPLOY.md.
