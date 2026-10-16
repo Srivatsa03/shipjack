@@ -12,6 +12,19 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: shipjack
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: shipjack
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U shipjack" --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      # every store test also runs on Postgres
+      SHIPJACK_TEST_PG: postgresql://shipjack:ci-only@127.0.0.1:5432/shipjack
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

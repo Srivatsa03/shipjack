@@ -29,9 +29,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "jsonschema>=4.20", "uvicorn>=0.30"]
+dev = ["pytest>=8", "jsonschema>=4.20", "uvicorn>=0.30", "psycopg[binary]>=3.2"]
 serve = ["uvicorn>=0.30"]
 stripe = ["stripe>=11"]
+postgres = ["psycopg[binary]>=3.2"]
 
 [project.urls]
 Homepage = "https://github.com/Srivatsa03/shipjack"

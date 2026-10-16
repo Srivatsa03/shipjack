@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
-import sqlite3
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor
@@ -89,15 +88,16 @@ async def _storms(url: str, storms: int, size: int, token: str) -> list[dict]:
 
 
 def ledger(db: str, sessions: list[str] | None = None) -> dict:
-    """Count charges per checkout in the processor ledger. Read-only."""
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=60)
+    """Count charges per checkout in the processor ledger (a SQLite path or a Postgres URL). Read-only."""
+    from collections import Counter
+
+    from .store import open_database
+    database = open_database(db)
     try:
-        rows = conn.execute("SELECT json_extract(data, '$.reference'), COUNT(*) FROM ledger_charges "
-                            "GROUP BY 1").fetchall()
-        orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        per = Counter(json.loads(row[0]).get("reference") for row in database.read("SELECT data FROM ledger_charges"))
+        orders = database.read("SELECT COUNT(*) FROM orders")[0][0]
     finally:
-        conn.close()
-    per = dict(rows)
+        database.close()
     out = {"charges": sum(per.values()), "orders": orders,
            "checkouts_charged_more_than_once": sum(1 for c in per.values() if c > 1)}
     if sessions is not None:

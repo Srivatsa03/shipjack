@@ -8,7 +8,7 @@ from .catalog import Product
 from .mandates import TrustList
 from .merchant import Merchant
 from .psp import CredentialProvider, Processor
-from .store import Database, LedgerCharges, LedgerRefunds, SqliteRepo
+from .store import LedgerCharges, LedgerRefunds, SqliteRepo, _Database, open_database
 from .surface import Intent, TrustedSurface
 from .wallet import Wallet
 
@@ -43,13 +43,14 @@ class World:
         return dict(self.merchants[store_id].info)
 
 
-def build(stores: list[Store], processor: Processor | None = None, db: str | Database | None = None) -> World:
-    """``db`` (a SQLite path) keeps the merchants' state and the processor's ledger in that file."""
+def build(stores: list[Store], processor: Processor | None = None, db: str | _Database | None = None) -> World:
+    """``db`` (a SQLite path, a Postgres URL, or an open database) keeps the merchants' state and the
+    processor's ledger there."""
     surface = TrustedSurface()
     trust = TrustList([surface.verification_key()])
     processor = processor if processor is not None else Processor()
-    if db is not None and not isinstance(db, Database):
-        db = Database(db)
+    if db is not None and not isinstance(db, _Database):
+        db = open_database(db)
     if db is not None:
         processor.charges, processor.refunds = LedgerCharges(db), LedgerRefunds(db)
     credentials = CredentialProvider(trust)

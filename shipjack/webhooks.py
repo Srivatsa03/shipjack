@@ -166,7 +166,8 @@ class MemoryQueue:
 
 
 class SqliteQueue:
-    """Pending events in the store's SQLite file, written in the same transaction as the order change.
+    """Pending events in the store's database (SQLite or Postgres), written in the same transaction as
+    the order change.
 
     ``name`` is the destination (one queue per receiver URL). Every server process can queue; a lease
     (``leases`` table) lets one of them send at a time.
@@ -207,7 +208,8 @@ class SqliteQueue:
             row = conn.execute("SELECT holder, expires FROM leases WHERE name = ?", (self.lease,)).fetchone()
             if row is not None and row[0] != holder and row[1] >= now:
                 return False
-            conn.execute("INSERT OR REPLACE INTO leases (name, holder, expires) VALUES (?, ?, ?)",
+            conn.execute("INSERT INTO leases (name, holder, expires) VALUES (?, ?, ?) ON CONFLICT (name) "
+                         "DO UPDATE SET holder = excluded.holder, expires = excluded.expires",
                          (self.lease, holder, now + ttl))
             return True
 

@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from shipjack.catalog import Address, Product
@@ -29,10 +31,48 @@ def stores(**changes):
     return list(out.values())
 
 
-@pytest.fixture(params=["memory", "sqlite"])
+# Set SHIPJACK_TEST_PG to a Postgres URL (e.g. the docker compose db) to run every store test on Postgres too.
+PG = os.environ.get("SHIPJACK_TEST_PG", "")
+
+
+def pg_target():
+    """A fresh Postgres schema for one test, as a URL whose connections all use it."""
+    import uuid
+
+    import psycopg
+    schema = f"t_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(PG, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')
+    joiner = "&" if "?" in PG else "?"
+    return f"{PG}{joiner}options=-csearch_path%3D{schema}", schema
+
+
+@pytest.fixture
+def pg_cleanup():
+    """Drop each schema a test made, after closing every connection it opened."""
+    schemas = []
+    yield schemas
+    import psycopg
+
+    from shipjack.store import PostgresDatabase
+    PostgresDatabase.close_all()
+    with psycopg.connect(PG, autocommit=True) as conn:
+        for schema in schemas:
+            conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+@pytest.fixture(params=["memory", "sqlite"] + (["postgres"] if PG else []))
 def backend(request, tmp_path):
-    """Every test that takes a world runs twice: state in memory, and state in a SQLite file."""
-    return None if request.param == "memory" else str(tmp_path / "shipjack.db")
+    """Every test that takes a world runs on each store: in memory, a SQLite file, and (when
+    SHIPJACK_TEST_PG is set) Postgres."""
+    if request.param == "memory":
+        return None
+    if request.param == "sqlite":
+        return str(tmp_path / "shipjack.db")
+    cleanup = request.getfixturevalue("pg_cleanup")
+    url, schema = pg_target()
+    cleanup.append(schema)
+    return url
 
 
 @pytest.fixture
@@ -41,10 +81,18 @@ def world(backend):
 
 
 @pytest.fixture
-def make_world(backend, tmp_path):
+def make_world(request, backend, tmp_path):
     count = iter(range(1000))
-    return lambda **changes: build(stores(**changes),
-                                   db=None if backend is None else str(tmp_path / f"w{next(count)}.db"))
+
+    def make(**changes):
+        if backend is None:
+            return build(stores(**changes))
+        if backend.startswith("postgres"):
+            url, schema = pg_target()
+            request.getfixturevalue("pg_cleanup").append(schema)
+            return build(stores(**changes), db=url)
+        return build(stores(**changes), db=str(tmp_path / f"w{next(count)}.db"))
+    return make
 
 
 def hub_intent(world) -> Intent:

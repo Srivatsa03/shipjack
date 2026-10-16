@@ -2,7 +2,7 @@
 pays once, and several OS processes sharing one file never charge, refund or number anything twice.
 
 Every other test that takes a ``world`` already runs against both stores (see conftest.py). These are
-the properties only a database can have.
+the properties only a database can have, on SQLite and (with SHIPJACK_TEST_PG) Postgres.
 """
 
 import json
@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 
 import pytest
-from conftest import HOME, HUB, hub_intent, stores
+from conftest import HOME, HUB, PG, hub_intent, pg_target, stores
 from fastapi.testclient import TestClient
 from jwcrypto.jws import JWS
 from test_lifecycle import fake_stripe as idempotent_stripe
@@ -30,6 +30,16 @@ CARD = {"handler_id": "card", "instrument": {"type": "card", "credential": {"num
 SECRET = b"s" * 32
 
 
+@pytest.fixture(params=["sqlite"] + (["postgres"] if PG else []))
+def target(request, tmp_path):
+    """Where the store lives: a SQLite file, or (with SHIPJACK_TEST_PG) a fresh Postgres schema."""
+    if request.param == "sqlite":
+        return str(tmp_path / "s.db")
+    url, schema = pg_target()
+    request.getfixturevalue("pg_cleanup").append(schema)
+    return url
+
+
 def shop(db):
     world = build(stores(), db=str(db))
     return world, world.merchants["northwind"]
@@ -42,15 +52,15 @@ def new_session(m):
 # ---- a restart -------------------------------------------------------------------------------------------
 
 
-def test_everything_survives_a_restart(tmp_path):
-    _, m1 = shop(tmp_path / "s.db")
+def test_everything_survives_a_restart(target):
+    _, m1 = shop(target)
     sid = new_session(m1)
     oid = m1.complete_session(sid, CARD)["order"]["id"]
     m1.refund_order(oid, 500)
     m1.fulfill_order(oid, carrier="UPS", tracking_number="1Z999")
     before = m1.acp_order(oid)
 
-    w2, m2 = shop(tmp_path / "s.db")  # a new process on the same file
+    w2, m2 = shop(target)  # a new process on the same file
     assert m2.get_session(sid)["status"] == "completed"
     assert m2.acp_order(oid) == before
     assert [e["event"] for e in m2.audit] == ["session_created", "order_paid", "order_refunded", "order_fulfilled"]
@@ -62,11 +72,11 @@ def test_everything_survives_a_restart(tmp_path):
         m2.refund_order(oid, 1)
 
 
-def test_a_checkout_signed_before_a_restart_verifies_and_pays_after_it(tmp_path):
-    _, m1 = shop(tmp_path / "s.db")
+def test_a_checkout_signed_before_a_restart_verifies_and_pays_after_it(target):
+    _, m1 = shop(target)
     sid = new_session(m1)
     signed = m1.ap2_checkout(sid)["checkout_jwt"]
-    w2, m2 = shop(tmp_path / "s.db")
+    w2, m2 = shop(target)
     jws = JWS()
     jws.deserialize(signed)
     jws.verify(m2.verification_key())  # the restarted store publishes the key that signed it
@@ -74,12 +84,12 @@ def test_a_checkout_signed_before_a_restart_verifies_and_pays_after_it(tmp_path)
     assert wallet.pay(m2, sid)["status"] == "paid"
 
 
-def test_an_idempotent_replay_survives_a_restart(tmp_path):
+def test_an_idempotent_replay_survives_a_restart(target):
     headers = {"Authorization": "Bearer t", "API-Version": ACP_API_VERSION, "Idempotency-Key": "k-1"}
     body = {"items": [{"id": HUB.id}], "fulfillment_details": {"address": HOME}}
-    first = TestClient(create_app(shop(tmp_path / "s.db")[1], {"t": "platform"})).post(
+    first = TestClient(create_app(shop(target)[1], {"t": "platform"})).post(
         "/checkout_sessions", json=body, headers=headers)
-    again = TestClient(create_app(shop(tmp_path / "s.db")[1], {"t": "platform"})).post(
+    again = TestClient(create_app(shop(target)[1], {"t": "platform"})).post(
         "/checkout_sessions", json=body, headers=headers)
     assert again.headers["Idempotent-Replayed"] == "true" and again.json() == first.json()
 
@@ -87,8 +97,8 @@ def test_an_idempotent_replay_survives_a_restart(tmp_path):
 # ---- all or nothing ----------------------------------------------------------------------------------------
 
 
-def test_an_order_its_charge_and_its_webhook_commit_together_or_not_at_all(tmp_path):
-    w, m = shop(tmp_path / "s.db")
+def test_an_order_its_charge_and_its_webhook_commit_together_or_not_at_all(target):
+    w, m = shop(target)
     box = Outbox("https://platform.example/hook", SECRET, send=lambda *a: 200).attach(m)
     sid = new_session(m)
 
@@ -105,12 +115,12 @@ def test_an_order_its_charge_and_its_webhook_commit_together_or_not_at_all(tmp_p
     assert len(w.processor.charges) == 1 and box.pending() == 1
 
 
-def test_a_crash_after_stripe_charged_does_not_charge_twice(tmp_path, monkeypatch):
+def test_a_crash_after_stripe_charged_does_not_charge_twice(target, monkeypatch):
     """The rail charged, then the process died before it recorded the order. The retry sends the same
     idempotency key, so Stripe returns the first PaymentIntent instead of charging again."""
     stripe = idempotent_stripe()
     monkeypatch.setitem(sys.modules, "stripe", stripe)
-    world = build(stores(), processor=StripeProcessor(api_key="sk_test_x"), db=str(tmp_path / "s.db"))
+    world = build(stores(), processor=StripeProcessor(api_key="sk_test_x"), db=target)
     m = world.merchants["northwind"]
     sid = new_session(m)
     real, crashes = m.repo.add_order, iter([True])
@@ -130,10 +140,10 @@ def test_a_crash_after_stripe_charged_does_not_charge_twice(tmp_path, monkeypatc
     assert m.dispute_evidence(out["order"]["id"])["charge"]["psp_ref"] == "pi_fake_1"
 
 
-def test_a_crash_after_stripe_refunded_does_not_refund_twice(tmp_path, monkeypatch):
+def test_a_crash_after_stripe_refunded_does_not_refund_twice(target, monkeypatch):
     stripe = idempotent_stripe()
     monkeypatch.setitem(sys.modules, "stripe", stripe)
-    world = build(stores(), processor=StripeProcessor(api_key="sk_test_x"), db=str(tmp_path / "s.db"))
+    world = build(stores(), processor=StripeProcessor(api_key="sk_test_x"), db=target)
     m = world.merchants["northwind"]
     oid = m.complete_session(new_session(m), CARD)["order"]["id"]
     crashes = iter([True])
@@ -150,11 +160,11 @@ def test_a_crash_after_stripe_refunded_does_not_refund_twice(tmp_path, monkeypat
     assert len(stripe._calls["refunds"]) == 1 and world.processor.charges[0].refunded == 1000
 
 
-def test_a_declined_attempt_gets_a_new_key_so_the_retry_can_succeed(tmp_path, monkeypatch):
+def test_a_declined_attempt_gets_a_new_key_so_the_retry_can_succeed(target, monkeypatch):
     stripe = declining_stripe()
     monkeypatch.setitem(sys.modules, "stripe", stripe)
     processor = StripeProcessor(api_key="sk_test_x", payment_method=TEST_PM_DECLINE)
-    world = build(stores(), processor=processor, db=str(tmp_path / "s.db"))
+    world = build(stores(), processor=processor, db=target)
     m = world.merchants["northwind"]
     sid = new_session(m)
     assert m.complete_session(sid, CARD)["error"]["code"] == "payment_declined"
@@ -228,8 +238,8 @@ def test_refusals_cross_a_process_boundary():
         assert type(back) is type(exc) and back.code == exc.code and str(back) == str(exc)
 
 
-def test_processes_racing_to_pay_one_session_charge_it_once(tmp_path):
-    db = str(tmp_path / "s.db")
+def test_processes_racing_to_pay_one_session_charge_it_once(target):
+    db = target
     w, m = shop(db)
     sid = new_session(m)
     results = race(_pay, (db, sid), 8)
@@ -237,8 +247,8 @@ def test_processes_racing_to_pay_one_session_charge_it_once(tmp_path):
     assert len(w.processor.charges) == 1 and len(m.orders) == 1
 
 
-def test_processes_racing_to_refund_one_order_refund_it_once(tmp_path):
-    db = str(tmp_path / "s.db")
+def test_processes_racing_to_refund_one_order_refund_it_once(target):
+    db = target
     w, m = shop(db)
     oid = m.complete_session(new_session(m), CARD)["order"]["id"]
     results = race(_refund, (db, oid), 8)
@@ -246,8 +256,8 @@ def test_processes_racing_to_refund_one_order_refund_it_once(tmp_path):
     assert w.processor.charges[0].refunded == 3499 and len(w.processor.refunds) == 1
 
 
-def test_processes_creating_sessions_at_once_never_share_an_id(tmp_path):
-    db = str(tmp_path / "s.db")
+def test_processes_creating_sessions_at_once_never_share_an_id(target):
+    db = target
     shop(db)
     ids = [i for batch in race(_sessions, (db, 25), 4) for i in batch]
     assert len(ids) == 100 and len(set(ids)) == 100
@@ -270,9 +280,9 @@ def live_receiver():
     thread.join(timeout=5)
 
 
-def test_processes_share_one_outbox_and_keep_each_orders_events_in_order(tmp_path, live_receiver):
+def test_processes_share_one_outbox_and_keep_each_orders_events_in_order(target, live_receiver):
     url, state = live_receiver
-    db = str(tmp_path / "s.db")
+    db = target
     shop(db)
     delivered = race(_shop_and_send, (db, url), 4)
     assert sum(delivered) == 60 and state.duplicates == 0
@@ -282,8 +292,8 @@ def test_processes_share_one_outbox_and_keep_each_orders_events_in_order(tmp_pat
     assert len(by_order) == 20 and all(s == ["created", "shipped", "completed"] for s in by_order.values())
 
 
-def test_a_dead_senders_lease_expires_and_another_process_takes_over(tmp_path):
-    _, m = shop(tmp_path / "s.db")
+def test_a_dead_senders_lease_expires_and_another_process_takes_over(target):
+    _, m = shop(target)
     clock = type("C", (), {"t": 1_800_000_000.0, "__call__": lambda self: self.t})()
     sent = []
     first = Outbox("https://platform.example/hook", SECRET, send=lambda u, b, h, t: sent.append("first") or 200,

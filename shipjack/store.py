@@ -1,14 +1,16 @@
-"""Where a merchant keeps its state: in this process (the default), or in SQLite, so the state survives
-a restart and several server processes can share one store.
+"""Where a merchant keeps its state: in this process (the default), or in a database (SQLite or
+Postgres), so the state survives a restart and several server processes can share one store.
 
 The merchant talks to a *repository*, and every change runs inside ``repo.transaction()``:
 
 * ``MemoryRepo`` is one re-entrant lock around plain dicts and lists (the original behaviour).
-* ``SqliteRepo`` turns the same transaction into ``BEGIN IMMEDIATE`` on one SQLite file in WAL mode.
-  SQLite admits one writer at a time across every process, so "is this session still payable?" and
-  "record the charge" are one step even with several server processes racing for the same session.
-  Objects read inside a transaction are written back when it commits; if anything raises, nothing is
-  written.
+* ``SqliteRepo`` turns the same transaction into one database transaction that admits one writer at a
+  time across every process: ``BEGIN IMMEDIATE`` on a SQLite file in WAL mode, or a transaction holding
+  a Postgres advisory lock. So "is this session still payable?" and "record the charge" are one step
+  even with several server processes racing for the same session. Objects read inside a transaction
+  are written back when it commits; if anything raises, nothing is written.
+
+``open_database`` picks the backend: a ``postgresql://`` URL, or a SQLite file path.
 
 What the database holds: checkout sessions, orders and their payment records, receipts, the audit
 trail, idempotency responses, the webhook outbox, id counters, the merchant's checkout-signing key (so
@@ -21,12 +23,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict
 from typing import Any
 
-SCHEMA = """
+SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (merchant TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL,
                                      PRIMARY KEY (merchant, id));
 CREATE TABLE IF NOT EXISTS orders (seq INTEGER PRIMARY KEY AUTOINCREMENT, merchant TEXT NOT NULL,
@@ -50,6 +53,9 @@ CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEX
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (queue, state, order_id, seq);
 CREATE TABLE IF NOT EXISTS leases (name TEXT PRIMARY KEY, holder TEXT NOT NULL, expires REAL NOT NULL);
 """
+
+POSTGRES_SCHEMA = (SQLITE_SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY")
+                   .replace("BLOB", "BYTEA").replace("REAL", "DOUBLE PRECISION"))
 
 
 # ---- in this process ---------------------------------------------------------------------------------
@@ -116,24 +122,44 @@ class MemoryRepo:
 # ---- in SQLite --------------------------------------------------------------------------------------
 
 
-class Database:
-    """One SQLite file. A connection per thread; ``transaction`` nests, and only the outermost commits."""
+class _Database:
+    """One database. A connection per thread; ``transaction`` nests, and only the outermost commits.
 
-    def __init__(self, path: str):
-        self.path = str(path)
+    SQL is written once, with ``?`` placeholders and upserts that both SQLite and Postgres accept.
+    """
+
+    dialect = ""
+
+    def __init__(self):
         self._local = threading.local()
-        self.conn().executescript(SCHEMA)
+        self._all: list = []  # every connection opened, so close() can close them
+        self._guard = threading.Lock()
 
-    def conn(self) -> sqlite3.Connection:
+    def _connect(self):
+        raise NotImplementedError
+
+    def _begin(self, conn, write: bool) -> None:
+        raise NotImplementedError
+
+    def conn(self):
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(self.path, timeout=60, isolation_level=None)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=60000")
+            conn = self._connect()
+            with self._guard:
+                self._all.append(conn)
             self._local.conn, self._local.depth, self._local.flush, self._local.after = conn, 0, [], []
             self._local.writing = False
         return conn
+
+    def close(self) -> None:
+        with self._guard:
+            conns, self._all = self._all, []
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - closing is best effort
+                pass
+        self._local = threading.local()
 
     @property
     def active(self) -> bool:
@@ -156,7 +182,7 @@ class Database:
             finally:
                 self._local.depth -= 1
             return
-        conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        self._begin(conn, write)
         self._local.depth, self._local.writing = 1, write
         try:
             yield conn
@@ -188,6 +214,96 @@ class Database:
             return conn.execute(sql, args)
 
 
+
+
+class Database(_Database):
+    """A SQLite file in WAL mode. ``BEGIN IMMEDIATE`` takes the one writer lock for a write transaction."""
+
+    dialect = "sqlite"
+
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = str(path)
+        self.conn().executescript(SQLITE_SCHEMA)
+
+    def _connect(self):
+        conn = sqlite3.connect(self.path, timeout=60, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=60000")
+        return conn
+
+    def _begin(self, conn, write: bool) -> None:
+        conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+
+
+class _PgConnection:
+    """A psycopg connection that takes this module's ``?`` placeholders."""
+
+    def __init__(self, conn):
+        self.raw = conn
+
+    def execute(self, sql: str, args: tuple = ()):
+        return self.raw.execute(sql.replace("?", "%s"), args)
+
+    def close(self) -> None:
+        self.raw.close()
+
+
+class PostgresDatabase(_Database):
+    """Postgres. A write transaction holds one transaction-scoped advisory lock, so writes are serialised
+    across every process exactly as SQLite serialises them; reads see one snapshot. ``schema`` keeps the
+    tables in their own namespace (the tests give each test its own)."""
+
+    dialect = "postgres"
+    LOCK = 0x5A1B_7AC5  # the store's writer lock
+    _open: weakref.WeakSet = weakref.WeakSet()
+
+    @classmethod
+    def close_all(cls) -> None:
+        """Close every connection any PostgresDatabase in this process opened (tests, shutdown)."""
+        for db in list(cls._open):
+            db.close()
+
+    def __init__(self, url: str, schema: str | None = None):
+        super().__init__()
+        self.url, self.schema = url, schema
+        PostgresDatabase._open.add(self)
+        conn = self.conn()
+        if schema:
+            conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+            conn.execute(f'SET search_path TO "{schema}"')
+        conn.execute("SELECT pg_advisory_lock(?)", (self.LOCK,))  # one process creates the tables at a time
+        try:
+            conn.raw.execute(POSTGRES_SCHEMA)
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(?)", (self.LOCK,))
+
+    def _connect(self):
+        import psycopg
+        conn = psycopg.connect(self.url, autocommit=True)
+        if self.schema:
+            conn.execute(f'SET search_path TO "{self.schema}"')
+        return _PgConnection(conn)
+
+    def _begin(self, conn, write: bool) -> None:
+        if write:
+            conn.execute("BEGIN")
+            conn.execute("SELECT pg_advisory_xact_lock(?)", (self.LOCK,))
+        else:
+            conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+
+    def read(self, sql: str, args: tuple = ()) -> list[tuple]:
+        return [tuple(r) for r in super().read(sql, args)]
+
+
+def open_database(target: str) -> _Database:
+    """A ``postgresql://`` (or ``postgres://``) URL opens Postgres; anything else is a SQLite file path."""
+    if target.startswith(("postgresql://", "postgres://")):
+        return PostgresDatabase(target)
+    return Database(target)
+
+
 def _dump(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"))
 
@@ -204,7 +320,7 @@ def _session_to_dict(s) -> dict:
 class SqliteRepo:
     """One merchant's state in a shared SQLite database."""
 
-    def __init__(self, db: Database, merchant_id: str):
+    def __init__(self, db: _Database, merchant_id: str):
         self.db, self.merchant = db, merchant_id
         self._local = threading.local()
 
@@ -250,7 +366,7 @@ class SqliteRepo:
     def next_number(self) -> int:
         with self.db.transaction() as conn:
             return conn.execute("INSERT INTO counters (name, n) VALUES (?, 1) ON CONFLICT (name) "
-                                "DO UPDATE SET n = n + 1 RETURNING n", (f"session:{self.merchant}",)).fetchone()[0]
+                                "DO UPDATE SET n = counters.n + 1 RETURNING n", (f"session:{self.merchant}",)).fetchone()[0]
 
     def session(self, session_id: str):
         loaded = self._map()
@@ -316,8 +432,10 @@ class SqliteRepo:
         return SqliteQueue(self.db, name)
 
     def remember(self, slot: tuple, fingerprint: str, code: int, payload: Any) -> None:
-        self.db.write("INSERT OR REPLACE INTO idempotency (merchant, caller, path, key, fingerprint, code, payload) "
-                      "VALUES (?, ?, ?, ?, ?, ?, ?)", (self.merchant, *slot, fingerprint, code, _dump(payload)))
+        self.db.write("INSERT INTO idempotency (merchant, caller, path, key, fingerprint, code, payload) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (merchant, caller, path, key) DO UPDATE SET "
+                      "fingerprint = excluded.fingerprint, code = excluded.code, payload = excluded.payload",
+                      (self.merchant, *slot, fingerprint, code, _dump(payload)))
 
     # read-only views, for tests and tools (each read is fresh from the database)
     @property
@@ -351,7 +469,8 @@ class _Sessions(Mapping):
         return session
 
     def __iter__(self):
-        rows = self.repo.db.read("SELECT id FROM sessions WHERE merchant = ? ORDER BY rowid", (self.repo.merchant,))
+        rows = self.repo.db.read("SELECT id FROM sessions WHERE merchant = ? ORDER BY length(id), id",
+                                 (self.repo.merchant,))
         return iter([r[0] for r in rows])
 
     def __len__(self):
@@ -359,7 +478,7 @@ class _Sessions(Mapping):
 
 
 class _Rows(Sequence):
-    def __init__(self, db: Database, sql: str, args: tuple, make: Callable):
+    def __init__(self, db: _Database, sql: str, args: tuple, make: Callable):
         self.db, self.sql, self.args, self.make = db, sql, args, make
 
     def _all(self) -> list:
@@ -393,7 +512,7 @@ def _record_from_dict(d: dict) -> dict:
 class LedgerCharges(Sequence):
     """``Processor.charges`` kept in SQLite: append records a charge, reads are fresh."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: _Database):
         self.db = db
 
     def append(self, charge) -> None:
@@ -416,14 +535,17 @@ class LedgerCharges(Sequence):
 class LedgerRefunds(Sequence):
     """``Processor.refunds`` kept in SQLite. Appending a refund also adds it to its charge's refunded total."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: _Database):
         self.db = db
 
     def append(self, refund) -> None:
         with self.db.transaction() as conn:
             conn.execute("INSERT INTO ledger_refunds (data) VALUES (?)", (_dump(asdict(refund)),))
-            conn.execute("UPDATE ledger_charges SET data = json_set(data, '$.refunded', "
-                         "json_extract(data, '$.refunded') + ?) WHERE id = ?", (refund.amount, refund.charge_id))
+            row = conn.execute("SELECT data FROM ledger_charges WHERE id = ?", (refund.charge_id,)).fetchone()
+            if row is not None:
+                charge = json.loads(row[0])
+                charge["refunded"] += refund.amount
+                conn.execute("UPDATE ledger_charges SET data = ? WHERE id = ?", (_dump(charge), refund.charge_id))
 
     def _all(self) -> list:
         from .psp import Refund
