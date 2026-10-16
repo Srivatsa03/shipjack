@@ -56,14 +56,15 @@ def with_fake_stripe(monkeypatch):
 # ---- key safety (no network, no key) -------------------------------------------------------------
 
 
-def test_a_live_key_is_refused():
-    with pytest.raises(ValueError, match="TEST key"):
-        StripeProcessor(api_key="sk_live_123")
-
-
-def test_an_empty_key_is_refused():
+@pytest.mark.parametrize("key", ["sk_live_123", "rk_live_123", "pk_test_123", "nonsense", "sk_test", ""])
+def test_a_non_test_key_is_refused(key):
     with pytest.raises(ValueError):
-        StripeProcessor(api_key="")
+        StripeProcessor(api_key=key)
+
+
+@pytest.mark.parametrize("key", ["sk_test_abc", "rk_test_abc"])
+def test_a_secret_or_restricted_test_key_is_accepted(key):
+    assert StripeProcessor(api_key=key).api_key == key
 
 
 def test_from_env_reads_the_test_key(monkeypatch):

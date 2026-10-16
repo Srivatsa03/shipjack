@@ -37,10 +37,10 @@ class StripeProcessor(Processor):
 
     def __post_init__(self):
         if not self.api_key:
-            raise ValueError("StripeProcessor needs a Stripe test secret key (sk_test_...)")
-        if not self.api_key.startswith("sk_test_"):
-            # refuse anything that is not clearly a test key, so this can never touch live money
-            raise ValueError("refusing a key that is not a Stripe TEST key (sk_test_...)")
+            raise ValueError("StripeProcessor needs a Stripe test key (sk_test_... or rk_test_...)")
+        # accept a secret or restricted TEST key; refuse anything live, so this can never touch real money
+        if not (self.api_key.startswith("sk_test_") or self.api_key.startswith("rk_test_")):
+            raise ValueError("refusing a key that is not a Stripe TEST key (sk_test_... or rk_test_...)")
 
     @classmethod
     def from_env(cls, var: str = "STRIPE_TEST_KEY", **kwargs) -> StripeProcessor:
@@ -55,8 +55,9 @@ class StripeProcessor(Processor):
         except ImportError:  # pragma: no cover - exercised only without the extra installed
             raise PaymentError("processing_error", "stripe is not installed: pip install 'shipjack[stripe]'") from None
         client = stripe.StripeClient(self.api_key)
+        payment_intents = getattr(getattr(client, "v1", None), "payment_intents", None) or client.payment_intents
         try:
-            intent = client.payment_intents.create(params={
+            intent = payment_intents.create(params={
                 "amount": amount, "currency": currency.lower(), "payment_method": self.payment_method,
                 "confirm": True, "automatic_payment_methods": {"enabled": True, "allow_redirects": "never"},
                 "metadata": {"reference": reference[:400], "method": method}})
