@@ -72,6 +72,8 @@ closed, as the spec requires. The wallet also checks it before the agent key sig
 the merchant's published signing key, so an impostor store that copies a real merchant's id is
 refused before anything is signed.
 
+Proposed upstream as [AP2 issue #381](https://github.com/google-agentic-commerce/AP2/issues/381).
+
 ## With real models
 
 `shipjack llm-bench` puts a real model in the agent's seat. Each trial runs the three payment
