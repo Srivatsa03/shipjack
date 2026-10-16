@@ -147,6 +147,19 @@ class CredentialProvider:
         context.last_used_date = time.time()
         return token
 
+    def authorize_direct(self, approval: dict) -> str:
+        """Mint a single-use token from a user-signed direct approval the merchant has already verified.
+
+        Human-present mode: the user authorized this exact payee and amount on their trusted surface,
+        so there is no payment mandate chain and no open mandate. The processor still binds the token
+        to the payee, amount and checkout, and spends it once.
+        """
+        with self._lock:
+            token = "tok_" + secrets.token_urlsafe(12)
+            self._tokens[token] = _Scope(approval["checkout_hash"], approval["amount"], approval["currency"],
+                                         approval["payee_id"], time.time() + self.token_ttl, None)
+            return token
+
     def redeem(self, token: str) -> _Scope | None:
         scope = self._tokens.get(token)
         if scope is None or scope.used:

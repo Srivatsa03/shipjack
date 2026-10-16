@@ -158,6 +158,8 @@ class Merchant:
                 receipt = None
             elif handler == "ap2":
                 charge, receipt = self._complete_ap2(session, payment_data, amount)
+            elif handler == "direct":
+                charge, receipt = self._complete_direct(session, payment_data, amount)
             else:
                 raise CheckoutError("invalid", "unsupported payment handler", "$.payment_data.handler_id")
         except PaymentError as exc:
@@ -205,6 +207,23 @@ class Merchant:
                                              digest(session.checkout_jwt),
                                              text(payment_data.get("open_checkout_hash")) or None)
         return charge, self._receipt(mandate, "Success", order_id=f"ord_{session.id}")
+
+    def _complete_direct(self, session: Session, payment_data: dict, amount: int):
+        """Human-present: the user signed this exact checkout on their trusted surface."""
+        from .direct import verify_user_approval
+        if not session.checkout_jwt or not session.nonce:
+            raise PaymentError("invalid_mandate", "no signed checkout to approve: call ap2_checkout first")
+        text = lambda v: v if isinstance(v, str) else ""  # noqa: E731
+        approval, nonce = text(payment_data.get("approval")), session.nonce
+        session.nonce = None  # single use, success or not
+        claims, violations = verify_user_approval(approval, self.trust, aud=self.id, nonce=nonce,
+                                                  checkout_jwt=session.checkout_jwt, amount=amount)
+        if violations:
+            self._receipt(approval, "Error", error=violations[0].split(":")[0], detail="; ".join(violations))
+            raise PaymentError(error_code(violations), "; ".join(violations))
+        token = self.processor.credentials.authorize_direct(claims)
+        charge = self.processor.charge_token(self.account, token, amount, "USD", digest(session.checkout_jwt))
+        return charge, self._receipt(approval, "Success", order_id=f"ord_{session.id}")
 
     def _receipt(self, mandate: str, status: str, **extra) -> dict:
         try:

@@ -102,6 +102,22 @@ class TrustList:
             raise ValueError(f"root mandate signed by an untrusted key: {kid!r}")
         return self.keys[kid]
 
+    def verify_jws(self, token: str) -> dict:
+        """Verify a compact JWS signed by a trusted key (by the ``kid`` in its header) and return the payload.
+
+        Used for the user-signed direct approval in human-present mode. Raises ``ValueError`` if the
+        header is malformed, the ``kid`` is not on the list, or the signature does not verify.
+        """
+        from ap2.sdk.jwt_helper import verify_jwt
+        try:
+            header = json.loads(b64url_decode(token.split(".")[0]))
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"malformed JWS header: {exc}") from None
+        kid = header.get("kid") if isinstance(header, dict) else None
+        if kid not in self.keys:
+            raise ValueError(f"signed by an untrusted key: {kid!r}")
+        return verify_jwt(token, self.keys[kid])
+
 
 def _split(constraints: list[dict], sdk_types: set[str], supported: set[str]) -> tuple[list, list, list[str]]:
     sdk, ext, unknown = [], [], []
