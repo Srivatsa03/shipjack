@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "jsonschema>=4.20", "uvicorn>=0.30"]
 serve = ["uvicorn>=0.30"]
 stripe = ["stripe>=11"]
 
@@ -43,6 +43,7 @@ Repository = "https://github.com/Srivatsa03/shipjack"
 shipjack = "shipjack.cli:main"
 shipjack-mcp = "shipjack.mcp:main"
 shipjack-serve = "shipjack.http:main"
+shipjack-receiver = "shipjack.webhooks:main"
 
 [tool.setuptools]
 packages = ["shipjack"]

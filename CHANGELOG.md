@@ -4,6 +4,24 @@
 
 ### Added
 
+- **Order webhooks** (`shipjack/webhooks.py`, `shipjack-serve --webhook-url`, `shipjack-receiver`):
+  every order change goes to the agent platform as a signed ACP 2026-04-17 webhook (full Order
+  snapshot; `Merchant-Signature: t=..,v1=..`, HMAC-SHA256 of `t.body`). An outbox retries network
+  errors, 408, 425, 429 and 5xx with capped exponential backoff and the same `Request-Id`, dead-letters
+  any other answer, and holds an order's later events behind a failed one. Plain HTTP only to
+  localhost. The secret comes from `SHIPJACK_WEBHOOK_SECRET` (at least 32 bytes).
+- **Reference receiver** (`create_receiver`): 401 `invalid_signature` for a missing, malformed, stale or
+  wrong signature; drops duplicates by `Request-Id` and by signature (the `Request-Id` is not signed);
+  never lets an older snapshot replace a newer one; accepts unknown event types and statuses.
+- **ACP Order object and fulfillment** (`Merchant.acp_order`, `fulfill_order`, `mark_delivered`,
+  `cancel_order`; `POST /orders/{id}/fulfill|deliver|cancel`): line items with
+  `ordered`/`current`/`fulfilled` and derived status, shipping fulfillments with tracking and events,
+  digital delivery, refunds as adjustments, `amount_refunded`. `GET /orders/{id}` now returns this
+  object. Every webhook body is tested against the spec's schema (vendored in `tests/spec/`).
+- **Operator tokens**: refund, fulfill, deliver, cancel and evidence need a merchant operator token
+  (`create_app(..., operators=...)`, `SHIPJACK_OPERATOR_TOKEN`). Before, any agent platform token could
+  refund an order.
+
 - **Order lifecycle**: full and partial refunds (`Merchant.refund_order`, `POST /orders/{id}/refund`)
   on the rail that charged, including real Stripe Refunds in test mode; a merchant cannot refund more
   than it took, and concurrent refunds return the money once (locked in both the merchant and the

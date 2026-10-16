@@ -162,16 +162,18 @@ def test_the_audit_trail_holds_no_card_number_or_key(world):
 
 @pytest.fixture
 def api(world):
-    return TestClient(create_app(world.merchants["northwind"], {"t": "platform"}), raise_server_exceptions=False)
+    return TestClient(create_app(world.merchants["northwind"], {"t": "platform"}, operators={"op": "ops"}),
+                      raise_server_exceptions=False)
 
 
-def h(key="k"):
-    return {"Authorization": "Bearer t", "API-Version": ACP_API_VERSION, "Idempotency-Key": key}
+def h(key="k", token="op"):
+    return {"Authorization": f"Bearer {token}", "API-Version": ACP_API_VERSION, "Idempotency-Key": key}
 
 
 def test_order_refund_and_evidence_over_http(world, api):
     m, oid = card_order(world)
-    assert api.get(f"/orders/{oid}", headers=h()).json()["payment_status"] == "paid"
+    seen = api.get(f"/orders/{oid}", headers=h(token="t")).json()
+    assert seen["type"] == "order" and seen["status"] == "created" and seen["adjustments"] == []
     part = api.post(f"/orders/{oid}/refund", json={"amount": 1000}, headers=h("r1"))
     assert part.status_code == 200 and part.json()["remaining"] == 2499
     over = api.post(f"/orders/{oid}/refund", json={"amount": 9999}, headers=h("r2"))
@@ -180,6 +182,9 @@ def test_order_refund_and_evidence_over_http(world, api):
     assert rest.json()["payment_status"] == "refunded"
     ev = api.get(f"/orders/{oid}/evidence", headers=h())
     assert ev.status_code == 200 and ev.json()["charge"]["refunded"] == 3499
+    after = api.get(f"/orders/{oid}", headers=h(token="t")).json()
+    assert [a["amount"] for a in after["adjustments"]] == [1000, 2499]
+    assert after["totals"][-1] == {"type": "amount_refunded", "display_text": "Refunded", "amount": 3499}
 
 
 def test_a_replayed_refund_request_refunds_once(world, api):
@@ -195,6 +200,16 @@ def test_a_malformed_refund_amount_is_a_400(world, api, body):
     m, oid = card_order(world)
     r = api.post(f"/orders/{oid}/refund", json=body, headers=h(str(body)))
     assert r.status_code == 400 and world.processor.charges[0].refunded == 0
+
+
+def test_an_agent_platform_cannot_move_money_or_goods(world, api):
+    """Refunds, fulfillment, cancellation and evidence are the merchant's; a platform token gets 403."""
+    m, oid = card_order(world)
+    for path in ("refund", "fulfill", "deliver", "cancel"):
+        r = api.post(f"/orders/{oid}/{path}", json={}, headers=h(path, token="t"))
+        assert r.status_code == 403 and r.json()["code"] == "forbidden"
+    assert api.get(f"/orders/{oid}/evidence", headers=h(token="t")).status_code == 403
+    assert world.processor.charges[0].refunded == 0 and m.orders[0]["status"] == "created"
 
 
 def test_order_endpoints_need_auth_and_know_unknown_orders(world, api):

@@ -16,6 +16,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from ap2.sdk.jwt_helper import create_jwt
 from ap2.sdk.mandate import MandateClient
@@ -28,6 +29,11 @@ from .psp import PaymentError, Processor
 
 ACP_API_VERSION = "2026-04-17"
 MAX_QUANTITY = 1000  # per line; a store caps what one order can ask for
+ADDRESS_KEYS = ("name", "line_one", "line_two", "city", "state", "country", "postal_code")  # ACP Address
+
+
+def _now() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _locked(method):
@@ -81,11 +87,23 @@ class Merchant:
         self.receipts: list[dict] = []
         self.audit: list[dict] = []           # append-only log of what happened, for reconciliation and disputes
         self._records: dict[str, dict] = {}   # order id -> {charge, checkout_jwt, receipt, mandate_reference}
+        self.listeners: list = []              # called as listener(event_type, acp_order) after each order change
         self._count = 0
         self._lock = threading.RLock()
 
     def _log(self, event: str, **fields) -> None:
         self.audit.append({"ts": int(time.time()), "merchant": self.id, "event": event, **fields})
+
+    def _emit(self, event: str, order_id: str) -> None:
+        """Tell listeners (e.g. the webhook outbox) about an order change, with the lock still held.
+
+        Holding the lock keeps one order's events in the order the changes happened, and the snapshot
+        is the full ACP Order at that moment, never a delta.
+        """
+        if self.listeners:
+            snapshot = self.acp_order(order_id)
+            for listener in list(self.listeners):
+                listener(event, snapshot)
 
     @property
     def id(self) -> str:
@@ -177,14 +195,16 @@ class Merchant:
         order = {"id": f"ord_{session.id}", "checkout_session_id": session.id,
                  "permalink_url": f"{self.info['website']}/orders/{session.id}", "merchant": self.id,
                  "account": charge.account, "amount": charge.amount, "method": charge.method,
-                 "payment_status": "paid", "refunded": 0,
-                 "items": list(session.items), "fulfillment_details": session.fulfillment.to_acp()}
+                 "payment_status": "paid", "refunded": 0, "status": "created", "created_at": _now(),
+                 "items": list(session.items), "fulfillment_details": session.fulfillment.to_acp(),
+                 "fulfillments": [], "adjustments": []}
         self.orders.append(order)
         self._records[order["id"]] = {"charge": charge, "checkout_jwt": session.checkout_jwt if handler != "card"
                                       else None, "receipt": receipt,
                                       "mandate_reference": (receipt or {}).get("claims", {}).get("reference", "")}
         self._log("order_paid", order=order["id"], amount=charge.amount, method=charge.method, psp_ref=charge.psp_ref)
         session.order, session.status, session.messages = order, "completed", []
+        self._emit("order_create", order["id"])
         out = self._render(session)
         if receipt:
             out["ap2_receipt"] = receipt
@@ -193,17 +213,124 @@ class Merchant:
     @_locked
     def refund_order(self, order_id: str, amount: int | None = None) -> dict:
         """Return money for an order, in full or in part, on the same rail that charged it."""
-        record = self._records.get(order_id)
-        if record is None:
-            raise CheckoutError("not_found", f"no order {order_id!r}")
-        order = next(o for o in self.orders if o["id"] == order_id)
+        out = self._refund(order_id, amount)
+        self._emit("order_update", order_id)
+        return out
+
+    def _refund(self, order_id: str, amount: int | None) -> dict:
+        record, order = self._order(order_id)
         refund = self.processor.refund(record["charge"], amount)
         order["refunded"] = record["charge"].refunded
         order["payment_status"] = "refunded" if order["refunded"] >= order["amount"] else "partially_refunded"
+        order["adjustments"].append({"id": f"adj_{len(order['adjustments']) + 1}", "type": "refund",
+                                     "occurred_at": _now(), "status": "completed", "amount": refund.amount,
+                                     "currency": refund.currency.lower()})
         self._log("order_refunded", order=order_id, amount=refund.amount, psp_ref=refund.psp_ref)
         return {"order_id": order_id, "refunded": refund.amount, "total_refunded": order["refunded"],
                 "remaining": order["amount"] - order["refunded"], "payment_status": order["payment_status"],
                 "psp_ref": refund.psp_ref}
+
+    # ---- after the order: fulfillment ----------------------------------------------------------
+    @_locked
+    def fulfill_order(self, order_id: str, *, carrier: str = "", tracking_number: str = "",
+                      tracking_url: str = "") -> dict:
+        """Hand the order over: physical lines ship (with tracking), digital lines are delivered by email."""
+        _, order = self._order(order_id)
+        if order["status"] != "created":
+            raise CheckoutError("invalid", f"order is already {order['status']}", "$.status")
+        for name, value in (("carrier", carrier), ("tracking_number", tracking_number), ("tracking_url", tracking_url)):
+            if not isinstance(value, str) or len(value) > 500:
+                raise CheckoutError("invalid", f"{name} must be text of at most 500 characters", f"$.{name}")
+        if tracking_url and not tracking_url.startswith("https://"):
+            raise CheckoutError("invalid", "tracking_url must be an https URL", "$.tracking_url")
+        lines = {kind: [{"id": f"li_{i + 1}", "quantity": qty} for i, (pid, qty) in enumerate(order["items"])
+                        if self.products[pid].kind == kind] for kind in ("physical", "digital")}
+        now = _now()
+        if lines["physical"]:
+            shipment = {"id": f"ful_{len(order['fulfillments']) + 1}", "type": "shipping", "status": "shipped",
+                        "line_items": lines["physical"],
+                        "events": [{"id": "evt_1", "type": "shipped", "occurred_at": now}]}
+            shipment.update({k: v for k, v in (("carrier", carrier), ("tracking_number", tracking_number),
+                                               ("tracking_url", tracking_url)) if v})
+            destination = _acp_address(order["fulfillment_details"].get("address"))
+            if destination:
+                shipment["destination"] = destination
+            order["fulfillments"].append(shipment)
+        if lines["digital"]:
+            order["fulfillments"].append({"id": f"ful_{len(order['fulfillments']) + 1}", "type": "digital",
+                                          "status": "delivered", "line_items": lines["digital"],
+                                          "events": [{"id": "evt_1", "type": "delivered", "occurred_at": now}]})
+        order["status"] = "shipped" if lines["physical"] else "completed"
+        self._log("order_fulfilled", order=order_id, status=order["status"], carrier=carrier or None)
+        self._emit("order_update", order_id)
+        return self.acp_order(order_id)
+
+    @_locked
+    def mark_delivered(self, order_id: str) -> dict:
+        """The carrier delivered every shipment: the order is complete."""
+        _, order = self._order(order_id)
+        if order["status"] != "shipped":
+            raise CheckoutError("invalid", f"order is {order['status']}, not shipped", "$.status")
+        now = _now()
+        for shipment in order["fulfillments"]:
+            if shipment["type"] == "shipping" and shipment["status"] != "delivered":
+                shipment["status"] = "delivered"
+                shipment["events"].append({"id": f"evt_{len(shipment['events']) + 1}", "type": "delivered",
+                                           "occurred_at": now})
+        order["status"] = "completed"
+        self._log("order_delivered", order=order_id)
+        self._emit("order_update", order_id)
+        return self.acp_order(order_id)
+
+    @_locked
+    def cancel_order(self, order_id: str) -> dict:
+        """Cancel a paid order before it ships, and return whatever has not been refunded yet."""
+        _, order = self._order(order_id)
+        if order["status"] != "created":
+            raise CheckoutError("invalid", f"order is already {order['status']}; it can no longer be canceled",
+                                "$.status")
+        if order["refunded"] < order["amount"]:
+            self._refund(order_id, None)
+        order["status"] = "canceled"
+        self._log("order_canceled", order=order_id)
+        self._emit("order_update", order_id)
+        return self.acp_order(order_id)
+
+    @_locked
+    def acp_order(self, order_id: str) -> dict:
+        """The order as ACP 2026-04-17 describes it (the full Order object a webhook carries)."""
+        _, order = self._order(order_id)
+        shipped: dict[str, int] = {}
+        for f in order["fulfillments"]:
+            for ref in f["line_items"]:
+                shipped[ref["id"]] = shipped.get(ref["id"], 0) + ref["quantity"]
+        canceled = order["status"] == "canceled"
+        line_items = []
+        for i, (pid, qty) in enumerate(order["items"]):
+            lid, product = f"li_{i + 1}", self.products[pid]
+            current, done = (0 if canceled else qty), shipped.get(f"li_{i + 1}", 0)
+            status = ("removed" if current == 0 else "fulfilled" if done >= current
+                      else "partial" if done else "processing")
+            line_items.append({"id": lid, "title": product.title, "product_id": pid,
+                               "quantity": {"ordered": qty, "current": current, "fulfilled": done},
+                               "unit_price": product.price, "subtotal": product.price * qty, "status": status})
+        subtotal = sum(self.products[pid].price * qty for pid, qty in order["items"])
+        totals = [{"type": "subtotal", "display_text": "Subtotal", "amount": subtotal}]
+        if order["amount"] != subtotal:  # a surcharge added at completion is shown, never hidden
+            totals.append({"type": "fee", "display_text": "Fee", "amount": order["amount"] - subtotal})
+        totals.append({"type": "total", "display_text": "Total", "amount": order["amount"]})
+        if order["refunded"]:
+            totals.append({"type": "amount_refunded", "display_text": "Refunded", "amount": order["refunded"]})
+        return {"type": "order", "id": order["id"], "checkout_session_id": order["checkout_session_id"],
+                "permalink_url": order["permalink_url"], "status": order["status"], "line_items": line_items,
+                "fulfillments": [dict(f) for f in order["fulfillments"]],
+                "adjustments": [dict(a) for a in order["adjustments"]], "totals": totals}
+
+    def _order(self, order_id: str) -> tuple[dict, dict]:
+        record = self._records.get(order_id)
+        if record is None:
+            raise CheckoutError("not_found", f"no order {order_id!r}")
+        return record, next(o for o in self.orders if o["id"] == order_id)
 
     def dispute_evidence(self, order_id: str) -> dict:
         """The non-repudiable picture AP2 describes: the signed checkout, the mandate, the receipt, the money.
@@ -211,10 +338,7 @@ class Merchant:
         It joins what the user approved (the merchant-signed checkout and the mandate/approval reference) to
         what actually moved (the charge and any refunds), so a dispute can be settled from stored evidence.
         """
-        record = self._records.get(order_id)
-        if record is None:
-            raise CheckoutError("not_found", f"no order {order_id!r}")
-        order = next(o for o in self.orders if o["id"] == order_id)
+        record, order = self._order(order_id)
         charge = record["charge"]
         jwt = record["checkout_jwt"]
         return {"order": dict(order), "merchant": dict(self.info),
@@ -390,3 +514,10 @@ class Merchant:
                 "fulfillment_details": session.fulfillment.to_acp(),
                 "iat": int(time.time()), "jti": secrets.token_urlsafe(12)}
 
+
+def _acp_address(address: dict | None) -> dict | None:
+    """An order's shipping address as an ACP Address, or None when a required field is missing."""
+    if not isinstance(address, dict):
+        return None
+    out = {k: address[k] for k in ADDRESS_KEYS if isinstance(address.get(k), str) and address[k]}
+    return out if all(k in out for k in ("name", "line_one", "city", "state", "country", "postal_code")) else None

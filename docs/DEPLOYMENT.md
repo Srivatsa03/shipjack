@@ -74,15 +74,30 @@ shipjack-mcp            # JSON-RPC 2.0 over stdio: initialize, tools/list, tools
 The five ACP operations are MCP tools (`create/get/update/complete/cancel_checkout_session`), called
 with `{meta, id?, payload?}`, plus `search_products`, `get_product` and `get_ap2_checkout`.
 
-## 7. After the order: refunds, evidence and the audit trail
+## 7. After the order: refunds, fulfillment, evidence and the audit trail
+
+The agent platform reads an order; only the merchant moves money or goods. Those routes take an
+*operator* token (the demo store's is `demo-operator`, or set `SHIPJACK_OPERATOR_TOKEN`), and an
+agent platform's token gets `403 forbidden` there.
 
 ```bash
-curl -s http://127.0.0.1:8000/orders/ord_cs_northwind_1 -H "Authorization: Bearer demo-token" -H "API-Version: 2026-04-17"
-curl -s -X POST http://127.0.0.1:8000/orders/ord_cs_northwind_1/refund \
-  -H "Authorization: Bearer demo-token" -H "API-Version: 2026-04-17" -H "Idempotency-Key: $(uuidgen)" \
-  -H "Content-Type: application/json" -d '{"amount": 1000}'          # omit amount for a full refund
-curl -s http://127.0.0.1:8000/orders/ord_cs_northwind_1/evidence -H "Authorization: Bearer demo-token" -H "API-Version: 2026-04-17"
+V="API-Version: 2026-04-17"; J="Content-Type: application/json"
+PLATFORM="Authorization: Bearer demo-token"; OPERATOR="Authorization: Bearer demo-operator"
+curl -s http://127.0.0.1:8000/orders/ord_cs_northwind_1 -H "$PLATFORM" -H "$V"      # the ACP Order
+curl -s -X POST http://127.0.0.1:8000/orders/ord_cs_northwind_1/refund -H "$OPERATOR" -H "$V" -H "$J" \
+  -H "Idempotency-Key: $(uuidgen)" -d '{"amount": 1000}'          # omit amount for a full refund
+curl -s -X POST http://127.0.0.1:8000/orders/ord_cs_northwind_1/fulfill -H "$OPERATOR" -H "$V" -H "$J" \
+  -H "Idempotency-Key: $(uuidgen)" -d '{"carrier": "USPS", "tracking_number": "9400111899223456789012"}'
+curl -s -X POST http://127.0.0.1:8000/orders/ord_cs_northwind_1/deliver -H "$OPERATOR" -H "$V" -H "$J" \
+  -H "Idempotency-Key: $(uuidgen)" -d '{}'
+curl -s http://127.0.0.1:8000/orders/ord_cs_northwind_1/evidence -H "$OPERATOR" -H "$V"
 ```
+
+- **The order** is the ACP 2026-04-17 Order object: line items with `ordered`/`current`/`fulfilled`
+  quantities and a derived status, fulfillments with tracking and events, adjustments for refunds,
+  and totals including `amount_refunded`. Status runs `created` → `shipped` → `completed`, or
+  `created` → `canceled` (cancel refunds whatever is left). A digital-only order is `completed` once
+  delivered. Steps out of order (deliver before shipping, cancel after shipping) are refused.
 
 - **Refunds** go back on the rail that charged: a real Stripe Refund in test mode, or the simulated
   processor. A merchant cannot refund more than it took, and two refunds at once return the money once.
@@ -91,16 +106,49 @@ curl -s http://127.0.0.1:8000/orders/ord_cs_northwind_1/evidence -H "Authorizati
   describes: the merchant-signed checkout and its hash, the mandate (or user approval) reference, the
   signed receipt, the charge with its PaymentIntent id, and every refund.
 - **The audit trail** (`Merchant.audit`) is an append-only log: session created, checkout signed, order
-  paid, order refunded. It holds ids, amounts and rail references, not card numbers or keys.
+  paid, refunded, fulfilled, delivered, canceled. It holds ids, amounts and rail references, not card
+  numbers or keys.
 
-## 8. The delivery constraint (recommended default on)
+## 8. Order webhooks: telling the agent platform what happened
+
+An agent needs to answer "where's my order?". ACP's answer is order webhooks: the merchant POSTs an
+event to the platform's receiver on every change. shipjack sends them as the 2026-04-17 spec says
+(full Order snapshot, never a delta; `Merchant-Signature: t=<unix>,v1=<HMAC-SHA256 of t.body>`), and
+adds what an integration needs to run unattended.
+
+```bash
+# the secret you share with the platform: from the environment, never on a command line
+export SHIPJACK_WEBHOOK_SECRET="$(openssl rand -hex 32)"
+shipjack-receiver --port 9000 &        # a reference receiver that verifies and prints each event
+shipjack-serve --webhook-url http://127.0.0.1:9000/agentic_checkout/webhooks/order_events
+```
+
+| Situation | What happens |
+|---|---|
+| Receiver answers 2xx | Delivered. |
+| Network error, 408, 425, 429 or 5xx | Retried with exponential backoff (1 s, 2 s, 4 s ... capped at 5 min, with jitter), same `Request-Id` every time, up to 8 attempts, then dead-lettered. |
+| Any other 4xx (or 3xx) | The event itself is wrong (bad secret, bad payload): dead-lettered at once, not retried forever. |
+| An order's event is waiting to retry | That order's later events wait behind it, so "created" can never arrive after "shipped". Other orders are not held. |
+| URL is plain `http://` | Refused unless it is localhost: signed order data leaves only over HTTPS. |
+
+The reference receiver (`shipjack.webhooks.create_receiver`) is what the platform side should do:
+401 `invalid_signature` for a missing, malformed, stale (over 300 s) or wrong signature, then three
+replay defenses. `Request-Id` is not covered by the signature, so it also remembers the signatures it
+accepted; a retry carries the same `Request-Id`; and an older snapshot of an order (earlier `t`) never
+replaces a newer one, so a captured "created" replayed after "shipped" cannot roll the order back.
+Unknown event types and statuses are accepted, as the spec requires.
+
+Today the outbox lives in memory: events queued when the process stops are lost. A merchant running
+this for real puts the outbox in the same database transaction as the order change.
+
+## 9. The delivery constraint (recommended default on)
 
 AP2 v0.2 does not constrain where goods are delivered. shipjack adds a checkout constraint,
 `io.github.srivatsa03.fulfillment`, that pins the allowed ship-to address and delivery email. The
 wallet checks it before signing and the merchant checks it again. Keep it on; see
 [AP2 issue #381](https://github.com/google-agentic-commerce/AP2/issues/381) and the README.
 
-## 9. Ship gate: the safety suite
+## 10. Ship gate: the safety suite
 
 Run `python -m pytest -q` before any change goes out. The suite is the deployment gate: AP2 MUSTs,
 the ACP API on bad input, address and email matching, concurrency, and seeded fuzzing. `shipjack
@@ -109,7 +157,7 @@ bench` prints what each payment profile stops.
 ## What is real and what is simulated
 
 - **Real:** the ACP REST contract and MCP binding, the AP2 SDK cryptography, the Stripe test-mode
-  settlement, the idempotency and concurrency handling.
-- **Simulated:** the product catalog, the merchant's onboarding, order fulfilment, and (without a
-  Stripe key) the money. Swapping the catalog and the processor for a merchant's real systems is the
+  settlement, signed order webhooks over HTTP, the idempotency and concurrency handling.
+- **Simulated:** the product catalog, the merchant's onboarding, the carrier (an operator marks an
+  order shipped and delivered), and (without a Stripe key) the money. Swapping the catalog and the processor for a merchant's real systems is the
   remaining integration work.

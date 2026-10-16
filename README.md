@@ -24,9 +24,14 @@ merchant up to both.
   buys inside them) and human-present (the user signs each purchase on a trusted surface).
 - **A real payment rail.** The processor settles through **Stripe test mode** (a confirmed
   PaymentIntent per order), or a simulated processor when no Stripe key is set.
-- **After the order.** Full and partial refunds on the same rail (real Stripe Refunds in test mode),
-  an append-only audit trail, and a dispute-evidence bundle that joins what the user approved (the
-  signed checkout and mandate) to what moved (the charge and refunds).
+- **After the order.** The ACP order lifecycle (created, shipped with tracking, completed, or
+  canceled), full and partial refunds on the same rail (real Stripe Refunds in test mode), an
+  append-only audit trail, and a dispute-evidence bundle that joins what the user approved (the
+  signed checkout and mandate) to what moved (the charge and refunds). Only a merchant operator token
+  can move money or goods; an agent platform's token gets 403.
+- **Order webhooks.** Every order change goes to the agent platform as a signed ACP webhook (full
+  Order snapshot, HMAC `Merchant-Signature`), with retries and backoff, dead-lettering, per-order
+  ordering, and a reference receiver that refuses forged, stale and replayed events.
 - **A safety suite.** 359 tests that break one input at a time, so the integration can be shipped
   with evidence, not hope. It is what surfaced the protocol gap below.
 
@@ -39,6 +44,10 @@ shipjack-serve                       # the store over HTTP; ACP discovery at /.w
 #   export STRIPE_TEST_KEY="$(security find-generic-password -a "$USER" -s stripe-test-key -w)"
 #   pip install -e ".[stripe]" && shipjack-serve --stripe
 shipjack-mcp                         # the same store as an MCP server over stdio
+# signed order webhooks to an agent platform (the secret comes from the environment):
+#   export SHIPJACK_WEBHOOK_SECRET="$(openssl rand -hex 32)"
+#   shipjack-receiver --port 9000 &
+#   shipjack-serve --webhook-url http://127.0.0.1:9000/agentic_checkout/webhooks/order_events
 ```
 
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for how a merchant adopts this.
@@ -241,7 +250,12 @@ at one named check.
 - `tests/test_mcp.py`: the ACP MCP binding, the JSON-RPC layer and whole purchases over MCP.
 - `tests/test_stripe.py` and `tests/test_lifecycle.py`: Stripe settlement and refunds (against a fake
   Stripe, plus live tests that run only with a test key), refund limits, concurrent refunds, dispute
-  evidence and the audit trail.
+  evidence, the audit trail, and that an agent platform cannot move money or goods.
+- `tests/test_webhooks.py`: every webhook body validates against the ACP 2026-04-17 schema (vendored
+  in `tests/spec/`); the signature is the spec's construction and a missing, malformed, stale, forged
+  or tampered one is refused; retries, backoff, dead-lettering and per-order ordering, also with 20
+  threads at once; replayed and older snapshots never change the receiver; and a purchase reaching a
+  real receiver over HTTP.
 
 Every fix in the changelog's hardening section came from a failing test of this kind. Taking a
 protection out makes a named test fail.
