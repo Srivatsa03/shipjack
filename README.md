@@ -24,7 +24,10 @@ merchant up to both.
   buys inside them) and human-present (the user signs each purchase on a trusted surface).
 - **A real payment rail.** The processor settles through **Stripe test mode** (a confirmed
   PaymentIntent per order), or a simulated processor when no Stripe key is set.
-- **A safety suite.** 330 tests that break one input at a time, so the integration can be shipped
+- **After the order.** Full and partial refunds on the same rail (real Stripe Refunds in test mode),
+  an append-only audit trail, and a dispute-evidence bundle that joins what the user approved (the
+  signed checkout and mandate) to what moved (the charge and refunds).
+- **A safety suite.** 359 tests that break one input at a time, so the integration can be shipped
   with evidence, not hope. It is what surfaced the protocol gap below.
 
 ## Run it
@@ -217,7 +220,7 @@ place as over the in-process API, so the delivery finding does not depend on the
 
 ## How it is tested
 
-276 tests, run in CI on Python 3.11 and 3.12. They break one input at a time, so a refusal always points
+359 tests, run in CI on Python 3.11 and 3.12. They break one input at a time, so a refusal always points
 at one named check.
 
 - `tests/test_conformance.py`: the AP2 MUSTs around mandate chains. Wrong audience, wrong or reused
@@ -234,6 +237,11 @@ at one named check.
   race window and fail without the locks.
 - `tests/test_fuzz.py`: seeded random and mutated input. Mutated mandates are refused or mean what the
   original meant, random JSON never makes the API crash or move money.
+- `tests/test_human_present.py`: the approval screen, the user-signed approval and its bindings.
+- `tests/test_mcp.py`: the ACP MCP binding, the JSON-RPC layer and whole purchases over MCP.
+- `tests/test_stripe.py` and `tests/test_lifecycle.py`: Stripe settlement and refunds (against a fake
+  Stripe, plus live tests that run only with a test key), refund limits, concurrent refunds, dispute
+  evidence and the audit trail.
 
 Every fix in the changelog's hardening section came from a failing test of this kind. Taking a
 protection out makes a named test fail.

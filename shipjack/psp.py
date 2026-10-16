@@ -32,6 +32,15 @@ class Charge:
     method: str  # "card", "ap2" or "direct"
     reference: str  # checkout session id, or the AP2 transaction_id (the checkout hash)
     psp_ref: str = ""  # the payment-rail id (e.g. a Stripe PaymentIntent), when a real PSP settled it
+    refunded: int = 0  # how much of this charge has been refunded
+
+
+@dataclass
+class Refund:
+    charge_reference: str
+    amount: int
+    currency: str
+    psp_ref: str = ""  # the payment-rail refund id, when a real PSP refunded it
 
 
 @dataclass
@@ -57,10 +66,30 @@ class Processor:
     """Moves the money. Each merchant has an account; ``registered`` is who that account really is."""
 
     charges: list[Charge] = field(default_factory=list)
+    refunds: list[Refund] = field(default_factory=list)
     registered: dict[str, str] = field(default_factory=dict)  # account -> merchant id it was onboarded as
     credentials: CredentialProvider | None = None
     binds_payee: bool = True  # pay out only if the token's payee is the account's onboarded identity
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)  # "unused" and "mark used" are one step
+
+    def refund(self, charge: Charge, amount: int | None = None) -> Refund:
+        """Return money for a charge, in full or in part. A merchant cannot refund more than it took."""
+        with self._lock:
+            amount = charge.amount - charge.refunded if amount is None else amount
+            if amount <= 0:
+                raise PaymentError("invalid_refund", "refund amount must be positive")
+            if charge.refunded + amount > charge.amount:
+                raise PaymentError("invalid_refund",
+                                   f"refund {amount} over the {charge.amount - charge.refunded} still refundable")
+            psp_ref = self._refund_rail(charge.psp_ref, amount, charge.currency)
+            charge.refunded += amount
+            refund = Refund(charge.reference, amount, charge.currency, psp_ref)
+            self.refunds.append(refund)
+            return refund
+
+    def _refund_rail(self, psp_ref: str, amount: int, currency: str) -> str:
+        """Return money on the payment rail. The base processor is simulated; a real PSP overrides this."""
+        return ""
 
     def charge_card(self, account: str, card_number: str, amount: int, currency: str, reference: str) -> Charge:
         """A raw card number authorizes any amount for anyone who holds it. That is the baseline."""
@@ -76,13 +105,16 @@ class Processor:
         return charge
 
     def charge_token(self, account: str, token: str, amount: int, currency: str, transaction_id: str,
-                     open_checkout_hash: str | None = None) -> Charge:
-        """An AP2 token pays one checkout, for its approved amount, to its approved payee, once."""
+                     open_checkout_hash: str | None = None, method: str = "ap2") -> Charge:
+        """An AP2 token pays one checkout, for its approved amount, to its approved payee, once.
+
+        ``method`` labels the charge: "ap2" for a mandate chain, "direct" for a user-signed approval.
+        """
         with self._lock:
-            return self._charge_token(account, token, amount, currency, transaction_id, open_checkout_hash)
+            return self._charge_token(account, token, amount, currency, transaction_id, open_checkout_hash, method)
 
     def _charge_token(self, account: str, token: str, amount: int, currency: str, transaction_id: str,
-                      open_checkout_hash: str | None = None) -> Charge:
+                      open_checkout_hash: str | None = None, method: str = "ap2") -> Charge:
         scope = self.credentials.redeem(token) if self.credentials else None
         if scope is None:
             raise PaymentError("payment_declined", "unknown or already used payment token")
@@ -97,9 +129,9 @@ class Processor:
             raise PaymentError("payment_declined", "token is bound to a different open checkout mandate")
         if self.binds_payee and self.registered.get(account) != scope.payee_id:
             raise PaymentError("payment_declined", f"token pays {scope.payee_id}, not account {account}")
-        psp_ref = self._settle(amount, currency, transaction_id, "ap2")
+        psp_ref = self._settle(amount, currency, transaction_id, method)
         scope.used = True  # settle first; a PSP decline must not spend the token
-        charge = Charge(account, amount, currency, "ap2", transaction_id, psp_ref)
+        charge = Charge(account, amount, currency, method, transaction_id, psp_ref)
         self.charges.append(charge)
         return charge
 

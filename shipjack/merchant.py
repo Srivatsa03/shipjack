@@ -79,8 +79,13 @@ class Merchant:
         self.sessions: dict[str, Session] = {}
         self.orders: list[dict] = []
         self.receipts: list[dict] = []
+        self.audit: list[dict] = []           # append-only log of what happened, for reconciliation and disputes
+        self._records: dict[str, dict] = {}   # order id -> {charge, checkout_jwt, receipt, mandate_reference}
         self._count = 0
         self._lock = threading.RLock()
+
+    def _log(self, event: str, **fields) -> None:
+        self.audit.append({"ts": int(time.time()), "merchant": self.id, "event": event, **fields})
 
     @property
     def id(self) -> str:
@@ -110,6 +115,7 @@ class Merchant:
         self._count += 1
         session = Session(f"cs_{self.id}_{self._count}", cart, details, buyer)
         self.sessions[session.id] = session
+        self._log("session_created", session=session.id, items=[list(i) for i in cart])
         return self._render(self._refresh(session))
 
     @_locked
@@ -171,13 +177,53 @@ class Merchant:
         order = {"id": f"ord_{session.id}", "checkout_session_id": session.id,
                  "permalink_url": f"{self.info['website']}/orders/{session.id}", "merchant": self.id,
                  "account": charge.account, "amount": charge.amount, "method": charge.method,
+                 "payment_status": "paid", "refunded": 0,
                  "items": list(session.items), "fulfillment_details": session.fulfillment.to_acp()}
         self.orders.append(order)
+        self._records[order["id"]] = {"charge": charge, "checkout_jwt": session.checkout_jwt if handler != "card"
+                                      else None, "receipt": receipt,
+                                      "mandate_reference": (receipt or {}).get("claims", {}).get("reference", "")}
+        self._log("order_paid", order=order["id"], amount=charge.amount, method=charge.method, psp_ref=charge.psp_ref)
         session.order, session.status, session.messages = order, "completed", []
         out = self._render(session)
         if receipt:
             out["ap2_receipt"] = receipt
         return out
+
+    @_locked
+    def refund_order(self, order_id: str, amount: int | None = None) -> dict:
+        """Return money for an order, in full or in part, on the same rail that charged it."""
+        record = self._records.get(order_id)
+        if record is None:
+            raise CheckoutError("not_found", f"no order {order_id!r}")
+        order = next(o for o in self.orders if o["id"] == order_id)
+        refund = self.processor.refund(record["charge"], amount)
+        order["refunded"] = record["charge"].refunded
+        order["payment_status"] = "refunded" if order["refunded"] >= order["amount"] else "partially_refunded"
+        self._log("order_refunded", order=order_id, amount=refund.amount, psp_ref=refund.psp_ref)
+        return {"order_id": order_id, "refunded": refund.amount, "total_refunded": order["refunded"],
+                "remaining": order["amount"] - order["refunded"], "payment_status": order["payment_status"],
+                "psp_ref": refund.psp_ref}
+
+    def dispute_evidence(self, order_id: str) -> dict:
+        """The non-repudiable picture AP2 describes: the signed checkout, the mandate, the receipt, the money.
+
+        It joins what the user approved (the merchant-signed checkout and the mandate/approval reference) to
+        what actually moved (the charge and any refunds), so a dispute can be settled from stored evidence.
+        """
+        record = self._records.get(order_id)
+        if record is None:
+            raise CheckoutError("not_found", f"no order {order_id!r}")
+        order = next(o for o in self.orders if o["id"] == order_id)
+        charge = record["charge"]
+        jwt = record["checkout_jwt"]
+        return {"order": dict(order), "merchant": dict(self.info),
+                "checkout": {"jwt": jwt, "hash": digest(jwt) if jwt else None},
+                "mandate_reference": record["mandate_reference"], "receipt": record["receipt"],
+                "charge": {"amount": charge.amount, "currency": charge.currency, "method": charge.method,
+                           "psp_ref": charge.psp_ref, "refunded": charge.refunded},
+                "refunds": [{"amount": r.amount, "currency": r.currency, "psp_ref": r.psp_ref}
+                            for r in self.processor.refunds if r.charge_reference == charge.reference]}
 
     # ---- AP2 -------------------------------------------------------------------------------------
     @_locked
@@ -189,6 +235,7 @@ class Merchant:
         session.checkout_jwt = create_jwt({"alg": "ES256", "typ": "JWT", "kid": self.key.get("kid")},
                                           self._ucp_checkout(session), self.key)
         session.nonce = secrets.token_urlsafe(16)
+        self._log("checkout_signed", session=session.id, checkout_hash=digest(session.checkout_jwt))
         return {"checkout_jwt": session.checkout_jwt, "nonce": session.nonce, "aud": self.id}
 
     def _complete_ap2(self, session: Session, payment_data: dict, amount: int):
@@ -222,7 +269,8 @@ class Merchant:
             self._receipt(approval, "Error", error=violations[0].split(":")[0], detail="; ".join(violations))
             raise PaymentError(error_code(violations), "; ".join(violations))
         token = self.processor.credentials.authorize_direct(claims)
-        charge = self.processor.charge_token(self.account, token, amount, "USD", digest(session.checkout_jwt))
+        charge = self.processor.charge_token(self.account, token, amount, "USD", digest(session.checkout_jwt),
+                                             method="direct")
         return charge, self._receipt(approval, "Success", order_id=f"ord_{session.id}")
 
     def _receipt(self, mandate: str, status: str, **extra) -> dict:

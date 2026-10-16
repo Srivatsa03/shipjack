@@ -74,14 +74,33 @@ shipjack-mcp            # JSON-RPC 2.0 over stdio: initialize, tools/list, tools
 The five ACP operations are MCP tools (`create/get/update/complete/cancel_checkout_session`), called
 with `{meta, id?, payload?}`, plus `search_products`, `get_product` and `get_ap2_checkout`.
 
-## 7. The delivery constraint (recommended default on)
+## 7. After the order: refunds, evidence and the audit trail
+
+```bash
+curl -s http://127.0.0.1:8000/orders/ord_cs_northwind_1 -H "Authorization: Bearer demo-token" -H "API-Version: 2026-04-17"
+curl -s -X POST http://127.0.0.1:8000/orders/ord_cs_northwind_1/refund \
+  -H "Authorization: Bearer demo-token" -H "API-Version: 2026-04-17" -H "Idempotency-Key: $(uuidgen)" \
+  -H "Content-Type: application/json" -d '{"amount": 1000}'          # omit amount for a full refund
+curl -s http://127.0.0.1:8000/orders/ord_cs_northwind_1/evidence -H "Authorization: Bearer demo-token" -H "API-Version: 2026-04-17"
+```
+
+- **Refunds** go back on the rail that charged: a real Stripe Refund in test mode, or the simulated
+  processor. A merchant cannot refund more than it took, and two refunds at once return the money once.
+  A failed Stripe refund changes nothing.
+- **Dispute evidence** rebuilds an order from stored records, the way AP2's "Dispute Evidence" section
+  describes: the merchant-signed checkout and its hash, the mandate (or user approval) reference, the
+  signed receipt, the charge with its PaymentIntent id, and every refund.
+- **The audit trail** (`Merchant.audit`) is an append-only log: session created, checkout signed, order
+  paid, order refunded. It holds ids, amounts and rail references, not card numbers or keys.
+
+## 8. The delivery constraint (recommended default on)
 
 AP2 v0.2 does not constrain where goods are delivered. shipjack adds a checkout constraint,
 `io.github.srivatsa03.fulfillment`, that pins the allowed ship-to address and delivery email. The
 wallet checks it before signing and the merchant checks it again. Keep it on; see
 [AP2 issue #381](https://github.com/google-agentic-commerce/AP2/issues/381) and the README.
 
-## 8. Ship gate: the safety suite
+## 9. Ship gate: the safety suite
 
 Run `python -m pytest -q` before any change goes out. The suite is the deployment gate: AP2 MUSTs,
 the ACP API on bad input, address and email matching, concurrency, and seeded fuzzing. `shipjack

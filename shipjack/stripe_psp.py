@@ -68,6 +68,21 @@ class StripeProcessor(Processor):
         self.settlements.append({"id": intent.id, "amount": amount, "currency": currency, "reference": reference})
         return intent.id
 
+    def _refund_rail(self, psp_ref: str, amount: int, currency: str) -> str:
+        if not psp_ref:
+            return ""  # nothing settled on the rail (e.g. a simulated charge); nothing to refund there
+        try:
+            import stripe
+        except ImportError:  # pragma: no cover
+            raise PaymentError("processing_error", "stripe is not installed") from None
+        client = stripe.StripeClient(self.api_key)
+        refunds = getattr(getattr(client, "v1", None), "refunds", None) or client.refunds
+        try:
+            refund = refunds.create(params={"payment_intent": psp_ref, "amount": amount})
+        except Exception as exc:
+            raise PaymentError("processing_error", f"stripe refund failed: {_scrub(str(exc))}") from None
+        return refund.id
+
 
 def _scrub(text: str) -> str:
     """Keep request ids and the key out of any error that reaches a caller or a log."""

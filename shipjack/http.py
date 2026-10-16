@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from .mandates import FULFILLMENT
 from .merchant import ACP_API_VERSION, CheckoutError, Merchant
+from .psp import PaymentError
 
 SUPPORTED_VERSIONS = [ACP_API_VERSION]
 log = logging.getLogger("shipjack.http")
@@ -159,6 +160,34 @@ def create_app(merchant: Merchant, tokens: dict[str, str]) -> FastAPI:
     @app.post("/checkout_sessions/{session_id}/ap2")
     async def ap2(request: Request, session_id: str):
         return await guarded(request, 200, lambda _: merchant.ap2_checkout(session_id))
+
+    # ---- after the order: status, refunds, dispute evidence (merchant operations) ----------------
+
+    def _order(order_id: str) -> dict:
+        found = next((o for o in merchant.orders if o["id"] == order_id), None)
+        if found is None:
+            raise CheckoutError("not_found", f"no order {order_id!r}")
+        return dict(found)
+
+    @app.get("/orders/{order_id}")
+    async def get_order(request: Request, order_id: str):
+        return await guarded(request, 200, lambda _: _order(order_id))
+
+    @app.post("/orders/{order_id}/refund")
+    async def refund(request: Request, order_id: str):
+        def act(body):
+            amount = body.get("amount")
+            if amount is not None and (isinstance(amount, bool) or not isinstance(amount, int)):
+                raise CheckoutError("invalid", "amount must be a whole number of cents", "$.amount")
+            try:
+                return merchant.refund_order(order_id, amount)
+            except PaymentError as exc:
+                raise CheckoutError(exc.code, str(exc), "$.amount") from None
+        return await guarded(request, 200, act)
+
+    @app.get("/orders/{order_id}/evidence")
+    async def evidence(request: Request, order_id: str):
+        return await guarded(request, 200, lambda _: merchant.dispute_evidence(order_id))
 
     return app
 

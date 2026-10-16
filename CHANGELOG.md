@@ -4,6 +4,15 @@
 
 ### Added
 
+- **Order lifecycle**: full and partial refunds (`Merchant.refund_order`, `POST /orders/{id}/refund`)
+  on the rail that charged, including real Stripe Refunds in test mode; a merchant cannot refund more
+  than it took, and concurrent refunds return the money once (locked in both the merchant and the
+  processor). `GET /orders/{id}`.
+- **Dispute evidence** (`Merchant.dispute_evidence`, `GET /orders/{id}/evidence`): the signed checkout,
+  the mandate or approval reference, the receipt, the charge and its refunds, per AP2's dispute section.
+- **Audit trail** (`Merchant.audit`): session created, checkout signed, order paid, order refunded.
+- Direct (human-present) charges are now recorded with method `direct`, not `ap2`.
+
 - **Runnable store** (`shipjack-serve`, `shipjack[serve]`): the ACP REST store over HTTP with a
   `/.well-known/acp.json` discovery document (transports, versions, payment handlers, extensions).
 - **Stripe test-mode processor** (`shipjack/stripe_psp.py`, `shipjack[stripe]`): settles each order
