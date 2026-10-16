@@ -17,10 +17,16 @@ First version.
   extensions) checks the merchant's published key and every constraint before the agent key signs.
 - Extension: `io.github.srivatsa03.fulfillment`, a checkout constraint on where goods go (ship-to
   address, delivery email). Verifiers that do not know it fail closed.
-- Bench: 9 scenarios (3 normal purchases, 6 attacks). `agent-checkout bench` runs a fully fooled
+- Bench: 12 scenarios (3 normal purchases, 9 attacks). `agent-checkout bench` runs a fully fooled
   scripted agent; `agent-checkout llm-bench` puts a real model in the agent's seat with paired runs
   across profiles, scored from the processor ledger and orders; `--rescore` rebuilds the tables;
   `agent-checkout demo` tells one scenario step by step.
-- Real-model results for gpt-oss-120b (45 paired trials on Groq): `docs/LLM_RESULTS.md`, with every
-  transcript in `docs/llm_results.json`.
+- Real-model results for gpt-oss-120b (Groq), gemini-3.1-flash-lite-preview and gemini-3.8-flash
+  (Gemini API): 45 paired trials each in `docs/LLM_RESULTS.md`, and a delivery study (5 variants x 10
+  trials) in `docs/DELIVERY_RESULTS.md`, with every transcript in the matching `.json` files.
+- Three more delivery attacks: the shipping and gift-card notices posted as customer reviews, and a
+  quiet same-city courier address.
+- `--provider gemini` (Gemini's OpenAI-compatible endpoint).
+- A trial in which the provider fails (an API error, as opposed to the model running out of steps) is
+  discarded and run again on resume, for every profile, so a rate limit never counts as a result.
 - Built on Google's AP2 SDK (pinned to e1ea56d, AP2 v0.2) and the ACP spec at 2026-04-17.

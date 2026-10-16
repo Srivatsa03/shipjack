@@ -35,10 +35,11 @@
 
 ## Of the real-model runs
 
-- **Open-weight models only,** on Groq's free tier: gpt-oss-120b, gpt-oss-20b and Qwen 3.8 27B.
-  No hosted frontier model was tested.
-- **Few trials.** Five trials per cell at temperature 0.6. Small differences between models or
-  scenarios are within sampling noise.
+- **Few models.** gpt-oss-120b (open-weight, on Groq), gemini-3.1-flash-lite-preview and
+  gemini-3.8-flash (Gemini API); runs for gpt-oss-20b and Qwen 3.8 27B are in progress. Other model
+  families may behave differently; the newest model here resisted every planted notice.
+- **Few trials.** Five trials per cell at temperature 0.6 (ten in the delivery study). Small
+  differences between models or scenarios are within sampling noise.
 - **Paired runs remove one kind of noise, not all of it.** The three profiles' worlds run in
   lockstep and share one conversation until a tool result differs between them; from then on, each
   group's continuation is sampled separately. So "what the model tried" is compared on identical
