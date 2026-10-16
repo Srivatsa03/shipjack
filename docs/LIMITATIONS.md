@@ -24,6 +24,22 @@
   fails closed, as the spec requires, so the extension only works where the merchant (or the
   agent's wallet) supports it.
 
+## Of the hardening
+
+- **Locks are in-process.** The merchant, processor and credential provider serialise their
+  check-then-act steps with `threading` locks. A deployment with several processes needs the same
+  guarantee from its database (a unique constraint on the idempotency key and a single-use update on
+  the token).
+- **The 24-hour cap on open mandates is this project's policy.** AP2 recommends a short expiry but
+  does not set a limit.
+- **Address matching is exact on purpose.** Street lines, unit, postal code and country are compared;
+  city and state are not, because the street line and postal code already identify the delivery point.
+  A plus-address (`a+b@x`) is a different mailbox and is refused. Both fail safe: an honest agent that
+  writes the address another way gets a refusal and can try again.
+- **The totals check covers checkouts without shipping, tax, fee or discount entries.** With such
+  entries the check still covers the lines and the subtotal but not the total.
+- **No real network, clock or disk faults.** The fuzzing is on inputs, not on infrastructure failure.
+
 ## Of the attacks
 
 - **The defenses and the attacks have the same author.** That is not an independent red team.

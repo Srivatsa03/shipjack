@@ -173,6 +173,29 @@ The last two are this project's convention: AP2 leaves the binding to the commer
 - ACP: [agentic-commerce-protocol](https://github.com/agentic-commerce-protocol/agentic-commerce-protocol),
   API version `2026-04-17`.
 
+## How it is tested
+
+276 tests, run in CI on Python 3.11 and 3.12. They break one input at a time, so a refusal always points
+at one named check.
+
+- `tests/test_conformance.py`: the AP2 MUSTs around mandate chains. Wrong audience, wrong or reused
+  nonce, a key nobody trusts, an expired or too-long-lived mandate, a tampered or changed checkout, an
+  unknown constraint, amount and currency boundaries, single-use tokens, a token for another checkout,
+  amount or payee.
+- `tests/test_matching.py`: where goods go. The same place written differently still matches (case,
+  abbreviations, ZIP+4, full-width digits, zero-width characters); a different street, unit, postal
+  code, an extra address field, a look-alike letter from another script, a second mailbox or a mailbox
+  on another domain does not.
+- `tests/test_api_edges.py`: the ACP API on malformed bodies, odd types, repeated and concurrent
+  requests, state after completion, idempotency scope, headers and server faults.
+- `tests/test_concurrency.py`: twelve threads at one token, one nonce, one session. The tests widen the
+  race window and fail without the locks.
+- `tests/test_fuzz.py`: seeded random and mutated input. Mutated mandates are refused or mean what the
+  original meant, random JSON never makes the API crash or move money.
+
+Every fix in the changelog's hardening section came from a failing test of this kind. Taking a
+protection out makes a named test fail.
+
 ## Related work
 
 - Aviv, Gandh, Bitton and Shabtai, [Beyond the Mandate: A Systematic Security Analysis of the Agent

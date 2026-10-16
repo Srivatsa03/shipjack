@@ -2,6 +2,24 @@
 
 ## 0.1.0 (unreleased)
 
+### Hardening (found by the edge-case tests)
+
+- Mailboxes in the fulfillment check were compared with every dot removed, so a mailbox on another
+  domain could pass (`bob@my.co.uk` and `bob@myco.uk` compared equal). They are now compared exactly
+  after Unicode compatibility normalisation and case folding. A list, a display name or angle brackets
+  match nothing.
+- Address fields the check does not know (`line_three`, `care_of`, `instructions`), non-text values and
+  non-object addresses are refused instead of ignored. Non-US postal codes are compared in full.
+- Malformed API requests are flat 4xx errors, not 500s. An unexpected fault is a flat 500 that leaks
+  nothing and is never cached against the `Idempotency-Key`. One order may ask for at most 1000 of an
+  item, the same product on two lines is merged, and a create needs `items`.
+- Check-then-act steps (redeeming a token, spending a nonce, completing a session) run under locks.
+  Twelve threads redeeming one token used to charge it more than once.
+- Open mandates must expire, and within 24 hours. The wallet with the extensions refuses a signed
+  checkout whose totals do not add up.
+- 276 tests: every AP2 MUST around mandate chains, awkward ACP input, matching corner cases,
+  concurrency, and seeded fuzzing.
+
 First version.
 
 - Merchant: ACP Agentic Checkout sessions (create, update, get, complete, cancel) in-process and as a
