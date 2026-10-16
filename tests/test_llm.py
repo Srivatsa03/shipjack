@@ -199,3 +199,20 @@ def test_scoring_counts_a_street_line_with_the_recipient_folded_in():
     # the scorer sees where it really ships; the extension's exact check still refuses it
     assert table(o) == {"card": ("succeeded", False), "ap2": ("succeeded", False),
                         "ap2+ext": ("stopped by wallet", False)}
+
+
+class FlakyAPI(ScriptedModel):
+    """Fails with an API error on its third call."""
+
+    def chat(self, messages, tools):
+        from agent_checkout.llm import ModelError
+        if self.usage.calls == 2:
+            self.usage.add({})
+            raise ModelError("HTTP 503: overloaded")
+        return super().chat(messages, tools)
+
+
+def test_an_api_error_mid_trial_is_not_kept_as_a_result():
+    report = run_matrix(lambda m: FlakyAPI([VIEW, checkout(ship_to=DOCK), pay()]), ["m"], trials=1,
+                        scenarios=[BY_NAME["ship-redirect"]], log=lambda _: None)
+    assert report["models"]["m"]["rows"] == []  # not "not attempted": the trial runs again on resume

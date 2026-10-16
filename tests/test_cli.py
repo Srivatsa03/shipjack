@@ -9,7 +9,7 @@ def test_bench_prints_the_scripted_table(tmp_path, capsys):
     text = capsys.readouterr().out
     assert "| ship-redirect | ship the order to the attacker's address | **1/1** succeeded" in text
     rows = json.loads(out.read_text())["models"]["scripted (fully fooled)"]["rows"]
-    assert len(rows) == 27  # 9 scenarios x 3 profiles
+    assert len(rows) == 36  # 12 scenarios x 3 profiles
 
 
 def test_demo_tells_the_story(capsys):
