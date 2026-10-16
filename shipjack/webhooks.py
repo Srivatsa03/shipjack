@@ -91,7 +91,7 @@ def verify(secret: bytes, body: bytes, header: str | None, *, now: float | None 
 
 def secret_from_env(var: str = SECRET_ENV) -> bytes:
     """The shared secret, from the environment. Refuses a missing or short one."""
-    value = os.environ.get(var, "")
+    value = os.environ.get(var, "").strip()
     if not value:
         raise ValueError(f"set {var} to the webhook secret you share with the agent platform")
     secret = value.encode()

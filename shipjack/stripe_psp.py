@@ -44,7 +44,7 @@ class StripeProcessor(Processor):
 
     @classmethod
     def from_env(cls, var: str = "STRIPE_TEST_KEY", **kwargs) -> StripeProcessor:
-        key = os.environ.get(var, "")
+        key = os.environ.get(var, "").strip()
         if not key:
             raise ValueError(f"set {var} to a Stripe test secret key (sk_test_...)")
         return cls(api_key=key, **kwargs)

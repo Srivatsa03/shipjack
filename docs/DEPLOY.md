@@ -47,7 +47,7 @@ Keep the string to yourself: paste it into Render in the next step, not into a c
    `shipjack-store` and `shipjack-assistant`, and the group `shipjack-shared`.
 3. Fill in what it asks for:
    - `GROQ_API_KEY`: copy it from the Keychain without showing it:
-     `security find-generic-password -a "$USER" -s groq-api-key -w | pbcopy`, then paste.
+     `security find-generic-password -a "$USER" -s groq-api-key -w | tr -d '\n' | pbcopy`, then paste.
    - `SHIPJACK_WEBHOOK_URL`, `SHIPJACK_STORE_URL`, `SHIPJACK_WEB_ORIGINS`: type `https://pending` for
      now; the real addresses exist only after the first deploy.
 4. **Apply**. The first build takes 10 to 15 minutes. The assistant's first start fails until the

@@ -398,3 +398,12 @@ async def test_a_partial_or_post_shipping_refund_does_not_cancel():
     await shop.say("it came scratched, refund it")
     out = await shop.resume({"approved": True})
     assert "Refunded $34.99" in shop.last(out) and shop.merchant.acp_order("ord_cs_northwind_1")["status"] == "shipped"
+
+
+def test_a_pasted_key_with_a_trailing_newline_still_works(monkeypatch):
+    """Found on the first deploy: a key copied with `security ... -w | pbcopy` ends in a newline, which no HTTP
+    header may contain, so every model call failed with a connection error."""
+    from shipjack.assistant.models import chat_model
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test_key_123\n")
+    model = chat_model("groq", "openai/gpt-oss-120b")
+    assert model.openai_api_key.get_secret_value() == "gsk_test_key_123"

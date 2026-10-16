@@ -27,7 +27,7 @@ from ..llm import PROVIDERS
 def chat_model(provider: str, model: str, *, temperature: float = 0.2, timeout: float = 45.0):
     """A chat model for ``provider`` (gemini or groq), or None when its key is not set."""
     url, env = PROVIDERS[provider]
-    key = os.environ.get(env, "")
+    key = os.environ.get(env, "").strip()  # a pasted key often carries a trailing newline; headers can't
     if not key:
         return None
     if provider == "gemini":
