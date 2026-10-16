@@ -1,0 +1,347 @@
+@import "tailwindcss";
+
+/* --------------------------------------------------------------------------
+ * shipjack: Liquid Glass
+ *
+ * Content sits straight on the wallpaper. Glass is only for the layer that
+ * floats above it: the sidebar, the toolbar, the composer, the approval sheet
+ * and small controls. Never glass on glass.
+ *
+ *   .glass        the regular material (sidebar, toolbar, bubbles, cards)
+ *   .glass-clear  for capsules and buttons: almost no frost, the lens shows most
+ *   .glass-tint   systemBlue poured into the glass, for primary actions
+ *   .glass-thick  a denser sheet for long reading (the approval sheet, the console)
+ *
+ * The lens (components/liquid-lens.tsx) bends the backdrop at each surface's
+ * rim on Chromium; elsewhere the glass is frosted, which still reads as glass.
+ * ------------------------------------------------------------------------ */
+
+:root {
+  color-scheme: dark;
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, "Helvetica Neue", Arial,
+    sans-serif;
+
+  /* labels, Apple's dark-appearance values */
+  --label: rgb(255 255 255 / 0.96);
+  --label-2: rgb(235 235 245 / 0.66);
+  --label-3: rgb(235 235 245 / 0.38);
+  --separator: rgb(255 255 255 / 0.12);
+
+  /* system colors */
+  --blue: #0a84ff;
+  --green: #30d158;
+  --orange: #ff9f0a;
+  --red: #ff453a;
+  --indigo: #5e5ce6;
+  --teal: #40c8e0;
+
+  /* the material */
+  --glass-fill: rgb(255 255 255 / 0.07);
+  --glass-fill-hover: rgb(255 255 255 / 0.12);
+  --glass-thick-fill: rgb(22 24 34 / 0.62);
+  --glass-rim: rgb(255 255 255 / 0.62);
+  --glass-rim-soft: rgb(255 255 255 / 0.1);
+  --glass-rim-far: rgb(255 255 255 / 0.32);
+  --glass-inner: inset 0 1px 1px 0 rgb(255 255 255 / 0.3), inset 0 -1px 1px 0 rgb(255 255 255 / 0.08),
+    inset 0 0 0 0.5px rgb(255 255 255 / 0.12), inset 0 0 22px -8px rgb(255 255 255 / 0.22);
+  --glass-shadow: 0 22px 48px -20px rgb(0 0 0 / 0.65), 0 2px 10px -2px rgb(0 0 0 / 0.3);
+  --glass-blur: 16px;
+  --glass-saturate: 1.8;
+  --glass-bright: 1.04;
+
+  /* concentric radii: an inner corner is the outer one minus the padding between them */
+  --r-sheet: 34px;
+  --r-panel: 28px;
+  --r-card: 20px;
+  --r-row: 14px;
+}
+
+@theme inline {
+  --font-sans: var(--font);
+  --color-label: var(--label);
+  --color-label-2: var(--label-2);
+  --color-label-3: var(--label-3);
+  --color-sep: var(--separator);
+  --color-blue: var(--blue);
+  --color-green: var(--green);
+  --color-orange: var(--orange);
+  --color-red: var(--red);
+  --color-indigo: var(--indigo);
+  --color-teal: var(--teal);
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #05070f;
+  color: var(--label);
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.47;
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "tnum" 0;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--blue) 45%, transparent);
+}
+
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--blue);
+    outline-offset: 2px;
+  }
+}
+
+@keyframes dim-in {
+  from {
+    opacity: 0;
+  }
+}
+.dim-in {
+  animation: dim-in 0.4s ease both;
+}
+
+/* ---- wallpapers -------------------------------------------------------- */
+
+.wallpaper {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-color: #05070f;
+  background-size: cover;
+  background-position: center;
+  transition: opacity 0.6s ease;
+}
+
+/* Tahoe: layered dunes at dusk, drawn as SVG (wallpapers.tsx). */
+.wallpaper[data-kind="tahoe"] {
+  background-image: var(--tahoe);
+}
+
+/* The Milky Way over snowy mountains. Photo on Unsplash by Benjamin Voros. */
+.wallpaper[data-kind="milkyway"] {
+  background-image: url("/wallpaper/milkyway-wide.webp");
+  background-position: center 55%;
+}
+@media (max-aspect-ratio: 1/1) {
+  .wallpaper[data-kind="milkyway"] {
+    background-image: url("/wallpaper/milkyway-tall.webp");
+  }
+}
+
+/* Graphite: a quiet studio backdrop for long working sessions. */
+.wallpaper[data-kind="graphite"] {
+  background-image: radial-gradient(120% 90% at 85% 10%, #3a3f52 0%, transparent 55%),
+    radial-gradient(90% 80% at 10% 95%, #2b3a4a 0%, transparent 60%), linear-gradient(160deg, #1c1f2a, #0e1016);
+}
+
+.wallpaper::after {
+  /* a veil, so text that sits straight on the photo stays readable */
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgb(4 6 14 / 0.18), rgb(4 6 14 / 0.42));
+}
+
+/* ---- the material ------------------------------------------------------ */
+
+@layer components {
+  .glass,
+  .glass-clear,
+  .glass-tint,
+  .glass-thick {
+    position: relative;
+    isolation: isolate;
+    background-color: var(--glass-fill);
+    -webkit-backdrop-filter: var(--lens,) blur(var(--glass-blur)) saturate(var(--glass-saturate))
+      brightness(var(--glass-bright));
+    backdrop-filter: var(--lens,) blur(var(--glass-blur)) saturate(var(--glass-saturate))
+      brightness(var(--glass-bright));
+    box-shadow: var(--glass-inner), var(--glass-shadow);
+  }
+
+  .glass-clear {
+    --glass-blur: 3px;
+    background-color: rgb(255 255 255 / 0.05);
+  }
+
+  .glass-thick {
+    --glass-blur: 36px;
+    background-color: var(--glass-thick-fill);
+  }
+
+  .glass-tint {
+    --glass-blur: 6px;
+    color: white;
+    background-color: color-mix(in oklab, var(--blue) 78%, transparent);
+    box-shadow: inset 0 1px 1px 0 rgb(255 255 255 / 0.45), inset 0 0 18px -6px rgb(255 255 255 / 0.45),
+      0 14px 30px -14px color-mix(in oklab, var(--blue) 85%, transparent);
+  }
+
+  /* The rim: bright where the light comes from (top left), faint on the far edge. */
+  .glass::before,
+  .glass-clear::before,
+  .glass-tint::before,
+  .glass-thick::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(
+      135deg,
+      var(--glass-rim) 0%,
+      var(--glass-rim-soft) 30%,
+      transparent 50%,
+      var(--glass-rim-soft) 70%,
+      var(--glass-rim-far) 100%
+    );
+    -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+
+  /* Controls answer a press: lift on hover, settle in on click. */
+  .press {
+    transition:
+      transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1),
+      background-color 0.25s ease,
+      box-shadow 0.25s ease;
+  }
+  .press:hover {
+    background-color: var(--glass-fill-hover);
+  }
+  .glass-tint.press:hover {
+    background-color: color-mix(in oklab, var(--blue) 90%, transparent);
+  }
+  .press:active {
+    transform: scale(0.96);
+    transition-duration: 0.12s;
+  }
+  .press:disabled {
+    opacity: 0.45;
+    pointer-events: none;
+  }
+
+  /* A filled row inside a sheet (Apple Pay's rows). */
+  .row {
+    background-color: rgb(255 255 255 / 0.06);
+    border-radius: var(--r-row);
+  }
+}
+
+/* ---- the one orchestrated moment: the approval sheet rises ------------- */
+
+@keyframes sheet-rise {
+  from {
+    transform: translateY(40px) scale(0.96);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+.sheet-rise {
+  animation: sheet-rise 0.55s cubic-bezier(0.22, 1.2, 0.36, 1) both;
+}
+
+/* a typing caret for streamed text */
+@keyframes caret {
+  50% {
+    opacity: 0;
+  }
+}
+.caret::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: var(--label-2);
+  animation: caret 1s steps(1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sheet-rise,
+  .caret::after {
+    animation: none;
+  }
+  .press {
+    transition: none;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass,
+  .glass-clear,
+  .glass-thick {
+    background-color: rgb(28 30 40 / 0.96);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+/* The scroll edge effect: content that slides under a floating bar softens
+ * into it instead of colliding with it (as in iOS 26). */
+.scroll-edge {
+  position: absolute;
+  inset-inline: 0;
+  pointer-events: none;
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+}
+.scroll-edge.top {
+  top: 0;
+  height: 84px;
+  background: linear-gradient(180deg, rgb(5 6 18 / 0.55), transparent);
+  -webkit-mask-image: linear-gradient(180deg, #000 45%, transparent);
+  mask-image: linear-gradient(180deg, #000 45%, transparent);
+}
+.scroll-edge.bottom {
+  bottom: 0;
+  height: 120px;
+  background: linear-gradient(0deg, rgb(5 6 18 / 0.55), transparent);
+  -webkit-mask-image: linear-gradient(0deg, #000 45%, transparent);
+  mask-image: linear-gradient(0deg, #000 45%, transparent);
+}
+
+.thin-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(255 255 255 / 0.18) transparent;
+}
+
+/* message text from the models: light markdown */
+.prose-msg p {
+  margin: 0 0 0.6em;
+}
+.prose-msg p:last-child {
+  margin-bottom: 0;
+}
+.prose-msg ul,
+.prose-msg ol {
+  margin: 0.2em 0 0.6em;
+  padding-left: 1.2em;
+}
+.prose-msg li {
+  margin: 0.15em 0;
+}
+.prose-msg strong {
+  font-weight: 600;
+}
