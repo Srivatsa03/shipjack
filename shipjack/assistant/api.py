@@ -54,6 +54,7 @@ class Settings:
     origins: list[str] = field(default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"])
     schema: str = "assistant"
     purchase_ttl_s: float = 15 * 60                    # a purchase card can be approved for this long
+    allow_imports: bool = True                         # catalog and document imports (off in the public demo)
     sweep_every_s: float = 30.0
 
     @classmethod
@@ -334,6 +335,43 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
             raise HTTPException(exc.status or 502, f"{exc.code}: {exc}") from None
         raise HTTPException(404, "action must be ship or deliver")
 
+    # ---- onboarding: the store's catalog and knowledge, through the store's operator API -------------
+    async def store_call(make):
+        from .store_client import StoreError
+        try:
+            return await make(state["deps"].store)
+        except StoreError as exc:
+            raise HTTPException(exc.status if exc.status and exc.status < 500 else 502, f"{exc.code}: {exc}") from None
+
+    @app.get("/api/ops/knowledge")
+    async def ops_knowledge(_: dict = Depends(operator)):
+        return {**await store_call(lambda s: s.documents()), "imports_allowed": settings.allow_imports}
+
+    @app.get("/api/ops/knowledge/search")
+    async def ops_search(q: str, kind: str | None = None, mode: str | None = None, _: dict = Depends(operator)):
+        return await store_call(lambda s: s.search_docs(q, kind, mode))
+
+    @app.get("/api/ops/sample-catalog")
+    async def sample_catalog(_: dict = Depends(operator)):
+        from importlib import resources
+        text = resources.files("shipjack").joinpath("data/northwind_shopify_export.csv").read_text()
+        return {"name": "northwind_shopify_export.csv", "csv": text}
+
+    @app.post("/api/ops/catalog")
+    async def ops_import(request: Request, _: dict = Depends(operator)):
+        if not settings.allow_imports:
+            raise HTTPException(403, "imports are off in the public demo; run shipjack locally to try them")
+        body = await request.json()
+        return await store_call(lambda s: s.import_catalog(str(body.get("csv", "")), key=f"import:{uuid.uuid4().hex}"))
+
+    @app.post("/api/ops/documents")
+    async def ops_document(request: Request, _: dict = Depends(operator)):
+        if not settings.allow_imports:
+            raise HTTPException(403, "imports are off in the public demo; run shipjack locally to try them")
+        body = await request.json()
+        return await store_call(lambda s: s.add_document(str(body.get("slug", "")), str(body.get("markdown", "")),
+                                                         key=f"doc:{uuid.uuid4().hex}"))
+
     @app.get("/api/ops/threads")
     async def ops_threads(_: dict = Depends(operator)):
         return await db()._all("SELECT t.id, t.title, t.updated, u.name AS user_name, "
@@ -388,7 +426,6 @@ def _recorder(db: AssistantDB):
 
 async def _default_deps(settings: Settings, db: AssistantDB) -> Deps:
     from .models import Models
-    from .policies import Policies
     from .store_client import StoreClient, StoreMCP
     store = StoreClient(settings.store_url, settings.store_token, settings.operator_token)
     try:
@@ -396,9 +433,17 @@ async def _default_deps(settings: Settings, db: AssistantDB) -> Deps:
     except Exception:  # noqa: BLE001 - the store may start after the assistant; the seller check is skipped then
         log.warning("store discovery failed at %s; the merchant-id check is off until restart", settings.store_url)
         discovery = {}
-    return Deps(store=store, mcp=StoreMCP(settings.store_url.rstrip("/") + "/mcp", settings.store_token),
-                models=Models.from_env(), payment=DEMO_CARD, orders_for=db.order_ids, record_order=_recorder(db),
-                policies=Policies.northwind().search, discovery=discovery)
+    mcp = StoreMCP(settings.store_url.rstrip("/") + "/mcp", settings.store_token)
+    return Deps(store=store, mcp=mcp, models=Models.from_env(), payment=DEMO_CARD, orders_for=db.order_ids,
+                record_order=_recorder(db), policies=store_policies(mcp), discovery=discovery)
+
+
+def store_policies(mcp):
+    """The store's own policy search (its knowledge base, over MCP), for the support agent."""
+    async def search(query: str) -> list[dict]:
+        hits = (await mcp.call("search_store_docs", payload={"query": query, "kind": "policy"}))["data"]
+        return [{"title": h["title"], "text": h["text"], "source": h["source"]} for h in hits[:3]]
+    return search
 
 
 def main(argv: list[str] | None = None) -> int:

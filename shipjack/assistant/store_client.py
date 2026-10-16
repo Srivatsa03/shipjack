@@ -98,6 +98,21 @@ class StoreClient:
     async def deliver(self, order_id: str, key: str) -> dict:
         return await self._send("POST", f"/orders/{order_id}/deliver", {}, key=key, operator=True)
 
+    # ---- onboarding and knowledge (operator) ----------------------------------------------------
+    async def import_catalog(self, csv_text: str, key: str) -> dict:
+        return await self._send("POST", "/admin/catalog", {"csv": csv_text}, key=key, operator=True)
+
+    async def add_document(self, slug: str, markdown: str, key: str) -> dict:
+        return await self._send("POST", "/admin/documents", {"slug": slug, "markdown": markdown}, key=key, operator=True)
+
+    async def documents(self) -> dict:
+        return await self._send("GET", "/knowledge/documents", operator=True)
+
+    async def search_docs(self, q: str, kind: str | None, mode: str | None, k: int = 5) -> dict:
+        from urllib.parse import urlencode
+        params = {"q": q, "k": k, **({"kind": kind} if kind else {}), **({"mode": mode} if mode else {})}
+        return await self._send("GET", f"/knowledge/search?{urlencode(params)}")
+
     async def cancel_order(self, order_id: str, key: str) -> dict:
         return await self._send("POST", f"/orders/{order_id}/cancel", {}, key=key, operator=True)
 

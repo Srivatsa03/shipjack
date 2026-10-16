@@ -159,6 +159,8 @@ def main(argv: list[str] | None = None) -> int:
     m.set_defaults(func=llm_bench)
     from .load import add_parser as add_load
     add_load(sub)
+    from .retrieval_eval import add_parser as add_retrieval
+    add_retrieval(sub)
     args = p.parse_args(argv)
     return args.func(args)
 

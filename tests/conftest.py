@@ -1,5 +1,7 @@
 import os
 
+os.environ.setdefault("SHIPJACK_EMBEDDER", "hash")  # tests never download a model
+
 import pytest
 
 from shipjack.catalog import Address, Product
@@ -44,7 +46,7 @@ def pg_target():
     with psycopg.connect(PG, autocommit=True) as conn:
         conn.execute(f'CREATE SCHEMA "{schema}"')
     joiner = "&" if "?" in PG else "?"
-    return f"{PG}{joiner}options=-csearch_path%3D{schema}", schema
+    return f"{PG}{joiner}options=-csearch_path%3D{schema},public", schema  # public: where pgvector's type lives
 
 
 @pytest.fixture

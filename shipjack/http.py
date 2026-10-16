@@ -55,11 +55,15 @@ def _fingerprint(body: Any) -> str:
     return hashlib.sha256(json.dumps(_canonical(body), separators=(",", ":")).encode()).hexdigest()
 
 
-def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[str, str] | None = None) -> FastAPI:
+def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[str, str] | None = None,
+               kb=None) -> FastAPI:
     """``tokens`` maps bearer tokens to caller identities (one per agent platform); ``operators`` maps
     the merchant's own staff or back-office tokens, which alone may move money or goods after an order."""
     app = FastAPI(title=f"{merchant.info['name']} agentic checkout", version=ACP_API_VERSION)
     operators = dict(operators or {})
+    if kb is None:
+        kb = default_knowledge(merchant)
+    app.state.kb = kb
 
     async def guarded(request: Request, status: int, action, *, operator: bool = False) -> JSONResponse:
         auth = request.headers.get("authorization", "")
@@ -140,7 +144,8 @@ def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[st
 
     @app.get("/products")
     async def search(request: Request, q: str = ""):
-        return await guarded(request, 200, lambda _: {"data": merchant.search(q)})
+        from .mcp import search_products
+        return await guarded(request, 200, lambda _: {"data": search_products(merchant, kb, q)})
 
     @app.get("/products/{product_id}")
     async def product(request: Request, product_id: str):
@@ -199,7 +204,7 @@ def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[st
         except ValueError:
             return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}},
                                 status_code=400)
-        store = mcp_by_caller.setdefault(caller, MCPStore(merchant))
+        store = mcp_by_caller.setdefault(caller, MCPStore(merchant, kb=kb))
         batch = message if isinstance(message, list) else [message]
         replies = []
         for item in batch:
@@ -218,6 +223,65 @@ def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[st
     @app.get("/mcp")
     async def mcp_stream():
         return Response(status_code=405, headers={"Allow": "POST"})  # no server-initiated stream
+
+    # ---- the store's knowledge: search for agents, onboarding for operators ----------------------------
+
+    @app.get("/knowledge/search")
+    async def knowledge_search(request: Request, q: str = "", kind: str | None = None, k: int = 4,
+                               mode: str | None = None):
+        def act(_):
+            if kind not in (None, "policy", "product") or mode not in (None, "hybrid", "vector", "keyword"):
+                raise CheckoutError("invalid", "kind must be policy or product; mode hybrid, vector or keyword")
+            return {"data": [h.as_dict() for h in kb.search(q[:500], kind=kind, k=max(1, min(k, 20)), mode=mode)],
+                    "vector": kb.vector}
+        return await guarded(request, 200, act)
+
+    @app.get("/knowledge/documents")
+    async def knowledge_documents(request: Request):
+        return await guarded(request, 200, lambda _: {"data": kb.documents(), "vector": kb.vector,
+                                                       "embedder": kb.embed.name if kb.vector else "keyword only"},
+                             operator=True)
+
+    @app.post("/admin/catalog")
+    async def import_catalog(request: Request):
+        """Onboard a catalog: a Shopify product export or a simple CSV, in ``{"csv": "..."}``."""
+        def act(body):
+            import time
+
+            from .knowledge import product_chunk
+            from .onboarding import parse_catalog
+            text = body.get("csv")
+            if not isinstance(text, str) or not text.strip():
+                raise CheckoutError("invalid", "send the CSV text as {\"csv\": \"...\"}", "$.csv")
+            started = time.perf_counter()
+            try:
+                parsed = parse_catalog(text)
+            except ValueError as exc:
+                raise CheckoutError("invalid", str(exc), "$.csv") from None
+            merchant.replace_catalog(parsed.products)
+            indexed = kb.replace("product", [product_chunk(p) for p in parsed.products])
+            return {"format": parsed.format, "imported": len(parsed.products), "indexed": indexed,
+                    "skipped": parsed.skipped[:50], "seconds": round(time.perf_counter() - started, 2)}
+        return await guarded(request, 200, act, operator=True)
+
+    @app.post("/admin/documents")
+    async def add_document(request: Request):
+        """Add or replace a policy page: ``{"slug": "returns", "markdown": "## Returns ..."}``."""
+        def act(body):
+            import re
+            import time
+
+            from .knowledge import policy_chunks
+            slug, text = body.get("slug"), body.get("markdown")
+            if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", slug):
+                raise CheckoutError("invalid", "slug must be lowercase letters, digits and dashes", "$.slug")
+            if not isinstance(text, str) or not text.strip() or len(text) > 200_000:
+                raise CheckoutError("invalid", "markdown must be 1 to 200,000 characters", "$.markdown")
+            started = time.perf_counter()
+            chunks = policy_chunks(text, slug)
+            kb.replace("policy", chunks, doc=slug)
+            return {"slug": slug, "chunks": len(chunks), "seconds": round(time.perf_counter() - started, 2)}
+        return await guarded(request, 200, act, operator=True)
 
     # ---- after the order: status for the platform; refunds, fulfillment and evidence for operators ----
 
@@ -266,6 +330,21 @@ def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[st
 
 class _NotAllowed(Exception):
     pass
+
+
+def default_knowledge(merchant: Merchant):
+    """The store's knowledge base, filled with its catalog and the bundled policies the first time.
+
+    On Postgres it lives in the database (hybrid search) and is filled once; in memory or SQLite it is
+    keyword-only and rebuilt at each start.
+    """
+    from .knowledge import KnowledgeBase, load_policies, policy_chunks, product_chunk
+    db = getattr(merchant.repo, "db", None)
+    kb = KnowledgeBase(merchant.id, db=db)
+    if not kb.documents():
+        kb.replace("product", [product_chunk(p) for p in merchant.products.values()])
+        kb.replace("policy", policy_chunks(load_policies(), "northwind-policies"), doc="northwind-policies")
+    return kb
 
 
 def _failure(request: Request, exc: Exception):

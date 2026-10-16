@@ -3,6 +3,7 @@
 import {
   Activity,
   ArrowLeft,
+  BookOpen,
   Bot,
   Check,
   CircleCheck,
@@ -13,8 +14,10 @@ import {
   Package,
   RotateCcw,
   ShieldCheck,
+  Search,
   Truck,
   TriangleAlert,
+  Upload,
   User as UserIcon,
   Webhook,
   X,
@@ -25,6 +28,9 @@ import { LiquidLens } from "@/components/liquid-lens";
 import {
   type Approval,
   ApiError,
+  type CatalogResult,
+  type KbHit,
+  type Knowledge,
   type Metrics,
   money,
   type OpsThread,
@@ -33,10 +39,11 @@ import {
   type StoredEvent,
 } from "@/lib/api";
 
-type View = "approvals" | "orders" | "runs" | "metrics";
+type View = "approvals" | "orders" | "catalog" | "runs" | "metrics";
 const VIEWS: { id: View; label: string; icon: typeof Inbox }[] = [
   { id: "approvals", label: "Refund requests", icon: Inbox },
   { id: "orders", label: "Orders", icon: Package },
+  { id: "catalog", label: "Catalog & knowledge", icon: BookOpen },
   { id: "runs", label: "Conversations", icon: MessagesSquare },
   { id: "metrics", label: "Health", icon: Gauge },
 ];
@@ -133,6 +140,7 @@ export function ConsoleApp() {
           )}
           {view === "approvals" && <Approvals pending={pending} onChange={refreshPending} />}
           {view === "orders" && <Orders />}
+          {view === "catalog" && <Catalog />}
           {view === "runs" && <Runs />}
           {view === "metrics" && <Health />}
         </div>
@@ -379,6 +387,241 @@ function StatusPill({ status }: { status: string }) {
           : "bg-orange/18 text-orange";
   const label = { created: "Placed", shipped: "Shipped", completed: "Delivered", canceled: "Canceled" }[status] ?? status;
   return <span className={"rounded-full px-2.5 py-0.5 text-[12.5px] font-medium " + tone}>{label}</span>;
+}
+
+// ---- catalog and knowledge: onboarding a merchant -----------------------------------------------------------
+
+function Catalog() {
+  const [kb, setKb] = useState<Knowledge | null>(null);
+  const [result, setResult] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [slug, setSlug] = useState("");
+  const [page, setPage] = useState("");
+  const load = useCallback(() => operator.knowledge().then(setKb), []);
+
+  useEffect(() => {
+    const first = window.setTimeout(load, 0);
+    return () => window.clearTimeout(first);
+  }, [load]);
+
+  const importCsv = async (csv: string, name: string) => {
+    setBusy(true);
+    setResult(null);
+    try {
+      const r: CatalogResult = await operator.importCatalog(csv);
+      setResult(
+        `Imported ${r.imported} products from ${name} (${r.format === "shopify" ? "a Shopify export" : "a simple CSV"}) ` +
+          `and indexed them for search in ${r.seconds} s.` +
+          (r.skipped.length ? ` Skipped ${r.skipped.length}: ${r.skipped.slice(0, 4).join("; ")}.` : ""),
+      );
+      load();
+    } catch (e) {
+      setResult(e instanceof ApiError ? e.message : "The import failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const addPage = async () => {
+    setBusy(true);
+    setResult(null);
+    try {
+      const r = await operator.addDocument(slug.trim(), page);
+      setResult(`Added "${r.slug}" as ${r.chunks} searchable section${r.chunks === 1 ? "" : "s"} in ${r.seconds} s.`);
+      setSlug("");
+      setPage("");
+      load();
+    } catch (e) {
+      setResult(e instanceof ApiError ? e.message : "That page couldn't be added.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const products = kb?.data.filter((d) => d.kind === "product").length ?? 0;
+  const pages = kb?.data.filter((d) => d.kind === "policy") ?? [];
+  const locked = kb ? !kb.imports_allowed : false;
+
+  return (
+    <section>
+      <Title sub="What the agents know about Northwind: its products and its policies. An import goes straight into the store's search.">
+        Catalog & knowledge
+      </Title>
+      {result && (
+        <p role="status" className="glass mb-4 rounded-[var(--r-card)] px-4 py-3 text-[14px]">
+          {result}
+        </p>
+      )}
+      <div className="grid gap-3 lg:grid-cols-2">
+        <div className="glass-thick rounded-[var(--r-panel)] p-4">
+          <h2 className="px-1 text-[16px] font-semibold">Import a catalog</h2>
+          <p className="mt-1 px-1 text-[13.5px] text-label-2">
+            A Shopify product export (Products, then Export) or a CSV with id, title and price. It replaces the
+            catalog; orders keep what they were sold as.
+          </p>
+          {locked ? (
+            <p className="row mt-3 px-3.5 py-3 text-[13.5px] text-label-2">
+              Imports are off in the public demo, so every visitor sees the same store. Run shipjack locally to try them.
+            </p>
+          ) : (
+            <div className="mt-3 flex flex-wrap gap-2">
+              <label className="glass-clear press inline-flex cursor-pointer items-center gap-1.5 rounded-full px-4 py-2 text-[14px]">
+                <Upload className="size-4" aria-hidden /> Choose a CSV file
+                <input
+                  type="file"
+                  accept=".csv,text/csv"
+                  className="sr-only"
+                  disabled={busy}
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    if (file) await importCsv(await file.text(), file.name);
+                    e.target.value = "";
+                  }}
+                />
+              </label>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={async () => {
+                  const sample = await operator.sampleCatalog();
+                  await importCsv(sample.csv, sample.name);
+                }}
+                className="glass-tint press rounded-full px-4 py-2 text-[14px] font-semibold"
+              >
+                Import the sample Shopify export
+              </button>
+            </div>
+          )}
+          <dl className="row mt-4 divide-y divide-white/10 px-3.5 text-[14px]">
+            <Pair k="Products" v={kb ? `${products} indexed` : "Loading"} />
+            <Pair k="Search" v={kb ? (kb.vector ? `by meaning (${kb.embedder.split(":").pop()})` : "keywords only (no Postgres)") : ""} />
+          </dl>
+        </div>
+
+        <div className="glass-thick rounded-[var(--r-panel)] p-4">
+          <h2 className="px-1 text-[16px] font-semibold">Policy pages</h2>
+          <ul className="row mt-3 divide-y divide-white/10 px-3.5 text-[14px]">
+            {pages.length === 0 && <li className="py-2.5 text-label-3">No pages yet.</li>}
+            {pages.map((d) => (
+              <li key={d.doc} className="flex justify-between py-2.5">
+                <span>{d.doc}</span>
+                <span className="text-label-3">
+                  {d.chunks} section{d.chunks === 1 ? "" : "s"}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {!locked && (
+            <form
+              className="mt-3 space-y-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                addPage();
+              }}
+            >
+              <input
+                value={slug}
+                onChange={(e) => setSlug(e.target.value)}
+                placeholder="Page name, e.g. student-discount"
+                className="row w-full px-3.5 py-2.5 text-[14px] outline-none placeholder:text-label-3"
+                aria-label="Page name"
+              />
+              <textarea
+                value={page}
+                onChange={(e) => setPage(e.target.value)}
+                rows={4}
+                placeholder={"## Student discount\nStudents get 10% off with a .edu email."}
+                className="row w-full resize-y px-3.5 py-2.5 text-[14px] outline-none placeholder:text-label-3"
+                aria-label="Page text (Markdown, one ## heading per topic)"
+              />
+              <button
+                type="submit"
+                disabled={busy || !slug.trim() || !page.trim()}
+                className="glass-clear press rounded-full px-4 py-2 text-[14px]"
+              >
+                Add page
+              </button>
+            </form>
+          )}
+        </div>
+      </div>
+      <SearchTester />
+    </section>
+  );
+}
+
+function SearchTester() {
+  const [q, setQ] = useState("");
+  const [kind, setKind] = useState("");
+  const [mode, setMode] = useState("vector");
+  const [hits, setHits] = useState<KbHit[] | null>(null);
+  const run = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (q.trim()) setHits((await operator.search(q.trim(), kind, mode)).data);
+  };
+  const choice = (value: string, current: string, set: (v: string) => void, label: string) => (
+    <button
+      key={label}
+      type="button"
+      onClick={() => set(value)}
+      aria-pressed={current === value}
+      className={"rounded-full px-3 py-1 text-[13px] " + (current === value ? "bg-white/18 text-label" : "text-label-2 hover:text-label")}
+    >
+      {label}
+    </button>
+  );
+  return (
+    <div className="glass-thick mt-3 rounded-[var(--r-panel)] p-4">
+      <h2 className="px-1 text-[16px] font-semibold">Try a search</h2>
+      <p className="mt-1 px-1 text-[13.5px] text-label-2">What the support and shopping agents get back for a question.</p>
+      <form onSubmit={run} className="mt-3 flex flex-wrap items-center gap-2">
+        <div className="row flex min-w-[240px] flex-1 items-center gap-2 px-3.5">
+          <Search className="size-4 text-label-3" aria-hidden />
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="e.g. the parcel left, can it go to my office instead"
+            className="w-full bg-transparent py-2.5 text-[14px] outline-none placeholder:text-label-3"
+            aria-label="Search question"
+          />
+        </div>
+        <div className="row flex gap-1 p-1" role="group" aria-label="What to search">
+          {choice("", kind, setKind, "All")}
+          {choice("product", kind, setKind, "Products")}
+          {choice("policy", kind, setKind, "Policies")}
+        </div>
+        <div className="row flex gap-1 p-1" role="group" aria-label="How to search">
+          {choice("vector", mode, setMode, "Meaning")}
+          {choice("hybrid", mode, setMode, "Hybrid")}
+          {choice("keyword", mode, setMode, "Keywords")}
+        </div>
+        <button type="submit" className="glass-tint press rounded-full px-4 py-2 text-[14px] font-semibold">
+          Search
+        </button>
+      </form>
+      {hits && (
+        <ol className="mt-3 space-y-2">
+          {hits.length === 0 && <li className="px-1 text-[14px] text-label-3">Nothing matched.</li>}
+          {hits.map((h, i) => (
+            <li key={h.source + i} className="row px-3.5 py-2.5">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <span className="text-[14px] font-medium">
+                  {i + 1}. {h.title}
+                </span>
+                <span className="tabular text-[12px] text-label-3">
+                  {h.vector_rank ? `meaning #${h.vector_rank}` : ""}
+                  {h.vector_rank && h.keyword_rank ? ", " : ""}
+                  {h.keyword_rank ? `keywords #${h.keyword_rank}` : ""}
+                </span>
+              </div>
+              <p className="mt-0.5 line-clamp-2 text-[13px] text-label-2">{h.text}</p>
+              <p className="mt-0.5 text-[12px] text-label-3">{h.source}</p>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
 }
 
 // ---- conversations: replay what the agents did -----------------------------------------------------------

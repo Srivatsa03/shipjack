@@ -103,6 +103,20 @@ class Merchant:
         self.account = f"acct_{id}"
         processor.registered[self.account] = id
         self.listeners: list = []  # called as listener(event_type, acp_order) after each order change
+        saved = self.repo.catalog()  # an imported catalog replaces the one this merchant was built with
+        if saved:
+            self.products = {d["id"]: _product(d) for d in saved}
+
+    @_locked
+    def replace_catalog(self, products: list[Product]) -> int:
+        """Swap in a new catalog (an import). Orders keep the lines they were bought with."""
+        if not products:
+            raise CheckoutError("invalid", "a catalog needs at least one product")
+        self.repo.save_catalog([{"id": p.id, "title": p.title, "price": p.price, "kind": p.kind,
+                                 "description": p.description, "reviews": list(p.reviews)} for p in products])
+        self.products = {p.id: p for p in products}
+        self._log("catalog_imported", products=len(products))
+        return len(products)
 
     # the state lives in the repository; these are read views of it
     @property
@@ -231,6 +245,9 @@ class Merchant:
                  "account": charge.account, "amount": charge.amount, "method": charge.method,
                  "payment_status": "paid", "refunded": 0, "status": "created", "created_at": _now(),
                  "items": list(session.items), "fulfillment_details": session.fulfillment.to_acp(),
+                 # what was bought, as it was sold then: a later catalog change must not rewrite the order
+                 "lines": [{"product_id": pid, "title": self.products[pid].title, "unit_price": self.products[pid].price,
+                            "kind": self.products[pid].kind, "quantity": qty} for pid, qty in session.items],
                  "fulfillments": [], "adjustments": []}
         self.repo.add_order(order, {"charge": charge, "checkout_jwt": session.checkout_jwt if handler != "card"
                                     else None, "receipt": receipt,
@@ -276,8 +293,9 @@ class Merchant:
                 raise CheckoutError("invalid", f"{name} must be text of at most 500 characters", f"$.{name}")
         if tracking_url and not tracking_url.startswith("https://"):
             raise CheckoutError("invalid", "tracking_url must be an https URL", "$.tracking_url")
+        kinds = [line["kind"] for line in _lines(order, self.products)]
         lines = {kind: [{"id": f"li_{i + 1}", "quantity": qty} for i, (pid, qty) in enumerate(order["items"])
-                        if self.products[pid].kind == kind] for kind in ("physical", "digital")}
+                        if kinds[i] == kind] for kind in ("physical", "digital")}
         now = _now()
         if lines["physical"]:
             shipment = {"id": f"ful_{len(order['fulfillments']) + 1}", "type": "shipping", "status": "shipped",
@@ -339,15 +357,15 @@ class Merchant:
                 shipped[ref["id"]] = shipped.get(ref["id"], 0) + ref["quantity"]
         canceled = order["status"] == "canceled"
         line_items = []
-        for i, (pid, qty) in enumerate(order["items"]):
-            lid, product = f"li_{i + 1}", self.products[pid]
+        for i, line in enumerate(_lines(order, self.products)):
+            qty = line["quantity"]
             current, done = (0 if canceled else qty), shipped.get(f"li_{i + 1}", 0)
             status = ("removed" if current == 0 else "fulfilled" if done >= current
                       else "partial" if done else "processing")
-            line_items.append({"id": lid, "title": product.title, "product_id": pid,
+            line_items.append({"id": f"li_{i + 1}", "title": line["title"], "product_id": line["product_id"],
                                "quantity": {"ordered": qty, "current": current, "fulfilled": done},
-                               "unit_price": product.price, "subtotal": product.price * qty, "status": status})
-        subtotal = sum(self.products[pid].price * qty for pid, qty in order["items"])
+                               "unit_price": line["unit_price"], "subtotal": line["unit_price"] * qty, "status": status})
+        subtotal = sum(li["subtotal"] for li in line_items)
         totals = [{"type": "subtotal", "display_text": "Subtotal", "amount": subtotal}]
         if order["amount"] != subtotal:  # a surcharge added at completion is shown, never hidden
             totals.append({"type": "fee", "display_text": "Fee", "amount": order["amount"] - subtotal})
@@ -494,6 +512,9 @@ class Merchant:
         return session
 
     def _total(self, session: Session) -> int:
+        missing = [pid for pid, _ in session.items if pid not in self.products]
+        if missing:
+            raise CheckoutError("invalid", f"{missing[0]!r} is no longer sold; update the cart", "$.items")
         return sum(self.products[pid].price * qty for pid, qty in session.items)
 
     def _refresh(self, session: Session) -> Session:
@@ -513,19 +534,26 @@ class Merchant:
         return session
 
     def _line_items(self, session: Session) -> list[dict]:
+        """A completed session shows what was sold (the order's lines); an open one, today's catalog."""
+        sold = {line["product_id"]: line for line in (session.order or {}).get("lines", [])}
         out = []
         for i, (pid, qty) in enumerate(session.items):
-            product, base = self.products[pid], self.products[pid].price * qty
-            out.append({"id": f"li_{i + 1}", "item": {"id": pid, "quantity": qty}, "name": product.title,
-                        "unit_amount": product.price, "base_amount": base, "discount": 0, "subtotal": base,
+            line = sold.get(pid)
+            product = self.products.get(pid)
+            title = line["title"] if line else product.title if product else f"{pid} (no longer sold)"
+            price = line["unit_price"] if line else product.price if product else 0
+            base = price * qty
+            out.append({"id": f"li_{i + 1}", "item": {"id": pid, "quantity": qty}, "name": title,
+                        "unit_amount": price, "base_amount": base, "discount": 0, "subtotal": base,
                         "tax": 0, "total": base})
         return out
 
     def _render(self, session: Session) -> dict:
         """The authoritative ACP cart state."""
-        total = self._total(session)
+        lines = self._line_items(session)
+        total = sum(li["total"] for li in lines)
         return {"id": session.id, "status": session.status, "currency": "usd",
-                "merchant": dict(self.claimed), "line_items": self._line_items(session),
+                "merchant": dict(self.claimed), "line_items": lines,
                 "fulfillment_details": session.fulfillment.to_acp(),
                 "totals": [{"type": "subtotal", "display_text": "Subtotal", "amount": total},
                            {"type": "fulfillment", "display_text": "Shipping", "amount": 0},
@@ -557,3 +585,16 @@ def _acp_address(address: dict | None) -> dict | None:
         return None
     out = {k: address[k] for k in ADDRESS_KEYS if isinstance(address.get(k), str) and address[k]}
     return out if all(k in out for k in ("name", "line_one", "city", "state", "country", "postal_code")) else None
+
+
+def _product(d: dict) -> Product:
+    return Product(d["id"], d["title"], d["price"], kind=d.get("kind", "physical"), description=d.get("description", ""),
+                   reviews=tuple(d.get("reviews", ())))
+
+
+def _lines(order: dict, products: dict) -> list[dict]:
+    """An order's lines as sold. Orders from before line snapshots fall back to the catalog."""
+    if order.get("lines"):
+        return order["lines"]
+    return [{"product_id": pid, "title": products[pid].title, "unit_price": products[pid].price,
+             "kind": products[pid].kind, "quantity": qty} for pid, qty in order["items"]]

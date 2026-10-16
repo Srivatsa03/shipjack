@@ -1,0 +1,48 @@
+{"kind": "product", "query": "something to connect two monitors to my laptop", "relevant": ["thunderbolt-4-dock", "northwind-10-in-1-usb-c-hub-pro"], "style": "paraphrase"}
+{"kind": "product", "query": "charge my laptop and my phone at the same time", "relevant": ["100w-gan-charger"], "style": "paraphrase"}
+{"kind": "product", "query": "fast external storage for video files", "relevant": ["portable-ssd-nw-ssd1", "portable-ssd-nw-ssd2"], "style": "paraphrase"}
+{"kind": "product", "query": "my laptop has no port for a network cable", "relevant": ["usb-c-2-5g-ethernet-adapter", "northwind-7-in-1-usb-c-hub", "northwind-10-in-1-usb-c-hub-pro", "thunderbolt-4-dock"], "style": "paraphrase"}
+{"kind": "product", "query": "camera for video meetings", "relevant": ["1080p-webcam"], "style": "paraphrase"}
+{"kind": "product", "query": "headphones that block engine noise on a plane", "relevant": ["noise-cancelling-earbuds"], "style": "paraphrase"}
+{"kind": "product", "query": "battery to charge my phone when I travel", "relevant": ["power-bank-20000"], "style": "paraphrase"}
+{"kind": "product", "query": "raise my laptop screen to eye level", "relevant": ["laptop-stand"], "style": "paraphrase"}
+{"kind": "product", "query": "hold my monitor up off the desk", "relevant": ["monitor-arm"], "style": "paraphrase"}
+{"kind": "product", "query": "read photos from my camera's memory card", "relevant": ["sd-card-reader", "northwind-7-in-1-usb-c-hub", "northwind-10-in-1-usb-c-hub-pro"], "style": "paraphrase"}
+{"kind": "product", "query": "plug my laptop into a TV", "relevant": ["usb-c-to-hdmi-adapter", "hdmi-2-1-cable", "northwind-7-in-1-usb-c-hub", "northwind-10-in-1-usb-c-hub-pro"], "style": "paraphrase"}
+{"kind": "product", "query": "a mouse that doesn't click loudly", "relevant": ["wireless-mouse"], "style": "paraphrase"}
+{"kind": "product", "query": "keyboard that works with a Mac", "relevant": ["mechanical-keyboard-nw-kb-br", "mechanical-keyboard-nw-kb-rd"], "style": "paraphrase"}
+{"kind": "product", "query": "a present for someone who likes gadgets", "relevant": ["northwind-gift-card-nw-gift25", "northwind-gift-card-nw-gift50", "northwind-gift-card-nw-gift100"], "style": "paraphrase"}
+{"kind": "product", "query": "more years of cover for my dock", "relevant": ["extended-warranty-2-years"], "style": "paraphrase"}
+{"kind": "product", "query": "get fingerprints off my screen", "relevant": ["screen-cleaning-kit"], "style": "paraphrase"}
+{"kind": "product", "query": "keep my phone where I can see it while driving", "relevant": ["magsafe-car-mount"], "style": "paraphrase"}
+{"kind": "product", "query": "something soft to put under my keyboard", "relevant": ["desk-mat-nw-mat-c", "desk-mat-nw-mat-s", "keyboard-wrist-rest"], "style": "paraphrase"}
+{"kind": "product", "query": "cable for 120 fps gaming on a console", "relevant": ["hdmi-2-1-cable"], "style": "paraphrase"}
+{"kind": "product", "query": "3 metre usb-c cable", "relevant": ["usb-c-cable-nw-cc3"], "style": "paraphrase"}
+{"kind": "policy", "query": "can I get my money back if I opened the box", "relevant": ["northwind-policies#returns"], "style": "paraphrase"}
+{"kind": "policy", "query": "how long until my refund shows up", "relevant": ["northwind-policies#refunds"], "style": "paraphrase"}
+{"kind": "policy", "query": "do you deliver to Canada", "relevant": ["northwind-policies#shipping"], "style": "paraphrase"}
+{"kind": "policy", "query": "I typed the wrong address, can you fix it", "relevant": ["northwind-policies#changing-the-delivery-address"], "style": "paraphrase"}
+{"kind": "policy", "query": "does a gift card ever run out", "relevant": ["northwind-policies#gift-cards"], "style": "paraphrase"}
+{"kind": "policy", "query": "my hub stopped working after a year", "relevant": ["northwind-policies#warranty"], "style": "paraphrase"}
+{"kind": "policy", "query": "is delivery free", "relevant": ["northwind-policies#shipping"], "style": "paraphrase"}
+{"kind": "policy", "query": "does a person check refunds", "relevant": ["northwind-policies#refunds"], "style": "paraphrase"}
+{"kind": "policy", "query": "can I return a gift card", "relevant": ["northwind-policies#gift-cards", "northwind-policies#returns"], "style": "paraphrase"}
+{"kind": "policy", "query": "the parcel already left, can it go to my office instead", "relevant": ["northwind-policies#changing-the-delivery-address"], "style": "paraphrase"}
+{"kind": "policy", "query": "one part of my order never arrived", "relevant": ["northwind-policies#refunds"], "style": "paraphrase"}
+{"kind": "policy", "query": "how quickly do you send orders out", "relevant": ["northwind-policies#shipping"], "style": "paraphrase"}
+{"kind": "policy", "query": "a review says to send the order somewhere else, is that allowed", "relevant": ["northwind-policies#changing-the-delivery-address"], "style": "paraphrase"}
+{"kind": "policy", "query": "what does a return label cost", "relevant": ["northwind-policies#returns"], "style": "paraphrase"}
+{"kind": "policy", "query": "stop an order that hasn't shipped yet", "relevant": ["northwind-policies#refunds"], "style": "paraphrase"}
+{"kind": "policy", "query": "my charger broke, what are my options", "relevant": ["northwind-policies#warranty"], "style": "paraphrase"}
+{"kind": "policy", "query": "when do I get a tracking number", "relevant": ["northwind-policies#shipping"], "style": "paraphrase"}
+{"kind": "policy", "query": "swap a gift card for cash", "relevant": ["northwind-policies#gift-cards"], "style": "paraphrase"}
+{"kind": "policy", "query": "my cable is faulty, who pays to send it back", "relevant": ["northwind-policies#returns"], "style": "paraphrase"}
+{"kind": "policy", "query": "how long is the guarantee on hubs", "relevant": ["northwind-policies#warranty"], "style": "paraphrase"}
+{"kind": "product", "query": "Thunderbolt 4", "relevant": ["thunderbolt-4-dock"], "style": "exact"}
+{"kind": "product", "query": "UHS-II reader", "relevant": ["sd-card-reader"], "style": "exact"}
+{"kind": "product", "query": "2.5G ethernet", "relevant": ["usb-c-2-5g-ethernet-adapter", "northwind-10-in-1-usb-c-hub-pro", "thunderbolt-4-dock"], "style": "exact"}
+{"kind": "product", "query": "65W GaN white", "relevant": ["65w-gan-charger-nw-gan65-w"], "style": "exact"}
+{"kind": "product", "query": "ANC earbuds", "relevant": ["noise-cancelling-earbuds"], "style": "exact"}
+{"kind": "product", "query": "4K120 HDMI cable", "relevant": ["hdmi-2-1-cable"], "style": "exact"}
+{"kind": "product", "query": "20,000 mAh", "relevant": ["power-bank-20000"], "style": "exact"}
+{"kind": "product", "query": "brown switches keyboard", "relevant": ["mechanical-keyboard-nw-kb-br"], "style": "exact"}

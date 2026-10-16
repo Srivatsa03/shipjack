@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEX
                                    last_status INTEGER, last_error TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (queue, state, order_id, seq);
 CREATE TABLE IF NOT EXISTS leases (name TEXT PRIMARY KEY, holder TEXT NOT NULL, expires REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS catalog (merchant TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL,
+                                    PRIMARY KEY (merchant, id));
 """
 
 POSTGRES_SCHEMA = (SQLITE_SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY")
@@ -74,6 +76,7 @@ class MemoryRepo:
         self._records: dict[str, dict] = {}
         self._idempotency: dict[tuple, tuple] = {}
         self._count = 0
+        self._catalog: list[dict] | None = None
 
     def transaction(self, write: bool = True):
         return self._lock
@@ -114,6 +117,12 @@ class MemoryRepo:
     def outbox_queue(self, name: str):
         from .webhooks import MemoryQueue
         return MemoryQueue()
+
+    def catalog(self) -> list[dict] | None:
+        return self._catalog
+
+    def save_catalog(self, products: list[dict]) -> None:
+        self._catalog = list(products)
 
     def remember(self, slot: tuple, fingerprint: str, code: int, payload: Any) -> None:
         self._idempotency[slot] = (fingerprint, code, payload)
@@ -272,7 +281,7 @@ class PostgresDatabase(_Database):
         conn = self.conn()
         if schema:
             conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-            conn.execute(f'SET search_path TO "{schema}"')
+            conn.execute(f'SET search_path TO "{schema}", public')
         conn.execute("SELECT pg_advisory_lock(?)", (self.LOCK,))  # one process creates the tables at a time
         try:
             conn.raw.execute(POSTGRES_SCHEMA)
@@ -283,7 +292,7 @@ class PostgresDatabase(_Database):
         import psycopg
         conn = psycopg.connect(self.url, autocommit=True)
         if self.schema:
-            conn.execute(f'SET search_path TO "{self.schema}"')
+            conn.execute(f'SET search_path TO "{self.schema}", public')
         return _PgConnection(conn)
 
     def _begin(self, conn, write: bool) -> None:
@@ -430,6 +439,17 @@ class SqliteRepo:
     def outbox_queue(self, name: str):
         from .webhooks import SqliteQueue
         return SqliteQueue(self.db, name)
+
+    def catalog(self) -> list[dict] | None:
+        """The imported catalog, or None if this merchant never imported one."""
+        rows = self.db.read("SELECT data FROM catalog WHERE merchant = ? ORDER BY id", (self.merchant,))
+        return [json.loads(r[0]) for r in rows] or None
+
+    def save_catalog(self, products: list[dict]) -> None:
+        with self.db.transaction() as conn:
+            conn.execute("DELETE FROM catalog WHERE merchant = ?", (self.merchant,))
+            for p in products:
+                conn.execute("INSERT INTO catalog (merchant, id, data) VALUES (?, ?, ?)", (self.merchant, p["id"], _dump(p)))
 
     def remember(self, slot: tuple, fingerprint: str, code: int, payload: Any) -> None:
         self.db.write("INSERT INTO idempotency (merchant, caller, path, key, fingerprint, code, payload) "

@@ -65,6 +65,10 @@ ACP_TOOLS = [
           {"meta": _META, "id": {"type": "string"}}, ["meta", "id"]),
     _tool("get_ap2_checkout", "[shipjack extension] Get the merchant-signed checkout JWT and a single-use "
           "nonce for an AP2 or direct payment.", {"meta": _META, "id": {"type": "string"}}, ["meta", "id"]),
+    _tool("search_store_docs", "[shipjack extension] Search the store's policy pages and catalog by meaning and "
+          "keywords. payload: query, optional kind ('policy' or 'product'). Each hit has its source to cite.",
+          {"meta": _META, "payload": {"type": "object", "properties": {"query": {"type": "string"},
+                                                                       "kind": {"type": "string"}}}}, ["meta"]),
 ]
 TOOL_NAMES = {t["name"] for t in ACP_TOOLS}
 
@@ -85,8 +89,9 @@ class MCPStore:
     """
 
     def __init__(self, merchant: Merchant, *, api_version: str = ACP_API_VERSION,
-                 server_name: str = "shipjack-store"):
+                 server_name: str = "shipjack-store", kb=None):
         self.merchant = merchant
+        self.kb = kb  # the store's knowledge base (hybrid search), when it has one
         self.api_version = api_version
         self.server_name = server_name
         self._seen: dict[tuple[str, str], dict] = {}
@@ -153,7 +158,13 @@ class MCPStore:
             if name == "cancel_checkout_session":
                 return m.cancel_session(sid)
             if name == "search_products":
-                return {"data": m.search(str(payload.get("query", "")))}
+                return {"data": search_products(m, self.kb, str(payload.get("query", "")))}
+            if name == "search_store_docs":
+                if self.kb is None:
+                    raise ToolError({"type": "invalid_request", "code": "unavailable",
+                                     "message": "this store has no knowledge base"})
+                kind = payload.get("kind") if payload.get("kind") in ("policy", "product") else None
+                return {"data": [h.as_dict() for h in self.kb.search(str(payload.get("query", ""))[:500], kind=kind)]}
             if name == "get_product":
                 return m.product(sid)
             if name == "get_ap2_checkout":
@@ -236,3 +247,16 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def search_products(merchant: Merchant, kb, query: str, k: int = 10) -> list[dict]:
+    """Products for a query: the knowledge base's hybrid ranking when there is one (it finds "something
+    for two monitors" without the word "hub"), else the catalog's keyword match. An empty query lists all."""
+    if kb is None or not query.strip():
+        return merchant.search(query)
+    out = []
+    for hit in kb.search(query[:500], kind="product", k=k):
+        p = merchant.products.get(hit.doc)
+        if p is not None:
+            out.append({"id": p.id, "title": p.title, "price": p.price, "currency": "usd", "kind": p.kind})
+    return out or merchant.search(query)

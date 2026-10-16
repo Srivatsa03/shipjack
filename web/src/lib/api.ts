@@ -167,7 +167,39 @@ export const operator = {
   thread: (id: string) => call<ThreadView>(`/api/threads/${id}`, OPERATOR_TOKEN),
   events: (id: string) => call<StoredEvent[]>(`/api/threads/${id}/events`, OPERATOR_TOKEN),
   metrics: () => call<Metrics>("/api/ops/metrics", OPERATOR_TOKEN),
+  knowledge: () => call<Knowledge>("/api/ops/knowledge", OPERATOR_TOKEN),
+  search: (q: string, kind: string, mode: string) =>
+    call<{ data: KbHit[]; vector: boolean }>(
+      `/api/ops/knowledge/search?${new URLSearchParams({ q, ...(kind ? { kind } : {}), ...(mode ? { mode } : {}) })}`,
+      OPERATOR_TOKEN,
+    ),
+  sampleCatalog: () => call<{ name: string; csv: string }>("/api/ops/sample-catalog", OPERATOR_TOKEN),
+  importCatalog: (csv: string) =>
+    call<CatalogResult>("/api/ops/catalog", OPERATOR_TOKEN, { method: "POST", body: JSON.stringify({ csv }) }),
+  addDocument: (slug: string, markdown: string) =>
+    call<{ slug: string; chunks: number; seconds: number }>("/api/ops/documents", OPERATOR_TOKEN, {
+      method: "POST",
+      body: JSON.stringify({ slug, markdown }),
+    }),
 };
+
+export type Knowledge = {
+  data: { kind: string; doc: string; chunks: number }[];
+  vector: boolean;
+  embedder: string;
+  imports_allowed: boolean;
+};
+export type KbHit = {
+  title: string;
+  text: string;
+  source: string;
+  kind: string;
+  doc: string;
+  score: number;
+  vector_rank: number | null;
+  keyword_rank: number | null;
+};
+export type CatalogResult = { format: string; imported: number; indexed: number; skipped: string[]; seconds: number };
 
 // A POST that answers with server-sent events. EventSource can't send a body or headers, so this
 // reads the response stream and splits it into events itself.

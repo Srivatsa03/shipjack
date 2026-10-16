@@ -16,9 +16,9 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
+from shipjack.assistant.api import store_policies
 from shipjack.assistant.graph import Deps, build_graph, check_checkout, make_messages
 from shipjack.assistant.models import Models, ScriptedChat, call, say
-from shipjack.assistant.policies import Policies
 from shipjack.assistant.store_client import StoreClient, StoreMCP
 from shipjack.http import create_app
 from shipjack.world import build
@@ -48,10 +48,12 @@ class Shop:
         async def record_order(thread, user_id, order):
             self.orders.setdefault(user_id, []).append(order["id"])
 
+        self.mcp_client = StoreMCP("http://store/mcp", "platform", transport=httpx.ASGITransport(app=self.app))
         self.deps = Deps(store=StoreClient("http://store", "platform", "op", transport=transport, backoff=0),
-                         mcp=StoreMCP("http://store/mcp", "platform", transport=httpx.ASGITransport(app=self.app)),
+                         mcp=self.mcp_client,
                          models=Models(models), payment=CARD, orders_for=orders_for, record_order=record_order,
-                         policies=Policies.northwind().search, discovery={"seller": dict(self.merchant.info)}, **deps)
+                         policies=store_policies(self.mcp_client), discovery={"seller": dict(self.merchant.info)},
+                         **deps)
         self.graph = build_graph(self.deps, checkpointer=InMemorySaver())
         self.config = {"configurable": {"thread_id": "t1"}}
 
