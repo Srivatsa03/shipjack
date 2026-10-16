@@ -29,7 +29,7 @@ def api_for():
         shop = Shop(script)
         schema = f"a_{uuid.uuid4().hex[:10]}"
         schemas.append(schema)
-        app = create_app(Settings(db_url=PG, schema=schema, webhook_secret=SECRET), deps=shop.deps)
+        app = create_app(Settings(db_url=PG, schema=schema, webhook_secret=SECRET, sweep_every_s=0.2), deps=shop.deps)
         client = TestClient(app)
         client.schema = schema
         client.__enter__()
@@ -131,10 +131,10 @@ def test_a_refund_waits_for_the_operator_and_resumes_in_the_background(api_for):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         msgs = client.get(f"/api/threads/{thread}", headers=SHOPPER).json()["messages"]
-        if "Refunded" in msgs[-1]["content"]:
+        if "refunded" in msgs[-1]["content"]:
             break
         time.sleep(0.1)
-    assert "Refunded $34.99" in msgs[-1]["content"] and shop.world.processor.charges[0].refunded == 3499
+    assert "canceled and $34.99 is refunded" in msgs[-1]["content"] and shop.world.processor.charges[0].refunded == 3499
     assert client.post(f"/api/ops/approvals/{ask['id']}", json={"approved": True}, headers=OPS).status_code == 409
 
 
@@ -180,3 +180,24 @@ def test_a_turn_needs_text(api_for):
     thread = client.post("/api/threads", headers=SHOPPER).json()["id"]
     assert client.post(f"/api/threads/{thread}/messages", json={"text": "  "}, headers=SHOPPER).status_code == 400
     assert client.post(f"/api/threads/{thread}/messages", json={"text": "x" * 2001}, headers=SHOPPER).status_code == 400
+
+
+def test_a_purchase_card_expires_and_is_cancelled(api_for):
+    """A card left unanswered can't be paid later: the decision is refused and the sweeper cancels it."""
+    import psycopg
+    client, shop = api_for(buy_hub_script())
+    thread = client.post("/api/threads", headers=SHOPPER).json()["id"]
+    card = [d for e, d in turn(client, thread, "buy a hub") if e == "approval"][0]
+    with psycopg.connect(PG, autocommit=True) as conn:  # age the card past the 15 minutes
+        conn.execute(f"UPDATE \"{client.schema}\".approvals SET created = now() - interval '16 minutes'")
+    late = client.post(f"/api/threads/{thread}/decision", json={"approval_id": card["id"], "approved": True},
+                       headers=SHOPPER)
+    assert late.status_code == 409 and not shop.world.processor.charges
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        view = client.get(f"/api/threads/{thread}", headers=SHOPPER).json()
+        if not view["pending"]:
+            break
+        time.sleep(0.2)
+    assert "expired before it was approved" in view["messages"][-1]["content"]
+    assert shop.merchant.get_session("cs_northwind_1")["status"] == "canceled" and not shop.world.processor.charges

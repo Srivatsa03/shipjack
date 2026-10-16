@@ -66,9 +66,11 @@ when the request is unclear. Keep replies brief and use the product titles and p
 
 SUPPORT_PROMPT = """You are the support agent for {store}, helping {name} with their orders.
 Use list_my_orders and get_order for order status, and search_policies for shipping, returns, refunds
-and gift cards; quote the policy you used. If the user asks for a refund the policy allows, call
-request_refund(order_id, amount_cents, reason); a store operator approves refunds, so say it was
-requested, not done. Amounts are in cents. You can only see this user's orders."""
+and gift cards; quote the policy you used. list_my_orders is newest first. If more than one order could
+be the one the user means, ask which, unless they clearly mean the newest ("the one I just got"). If the
+user asks for a refund the policy allows, call request_refund(order_id, amount_cents, reason) on an
+order with something refundable left; a store operator approves refunds, so say it was requested, not
+done. Amounts are in cents. You can only see this user's orders."""
 
 CHAT_PROMPT = """You are the shopping assistant for {store}. Answer briefly. You can find and buy
 products (with the user's approval before any charge) and help with orders, delivery and refunds."""
@@ -150,7 +152,7 @@ def build_graph(deps: Deps, checkpointer=None):
     async def list_my_orders(state: Annotated[dict, InjectedState]) -> str:
         """List this user's orders with their status and totals."""
         out = []
-        for order_id in await deps.orders_for(state["user"]["id"]):
+        for order_id in reversed(await deps.orders_for(state["user"]["id"])):  # newest first
             try:
                 out.append(_order_summary(await deps.store.order(order_id)))
             except StoreError as exc:
@@ -308,8 +310,9 @@ def build_graph(deps: Deps, checkpointer=None):
     def approve(state: State) -> dict:
         decision = interrupt({"kind": "purchase", "actor": "shopper", **state["checkout"]})
         approved = isinstance(decision, dict) and decision.get("approved") is True
-        _emit("approval", kind="purchase", approved=approved, by=(decision or {}).get("by") if isinstance(decision, dict) else None)
-        return {"approval": {"approved": approved, "by": (decision or {}).get("by") if isinstance(decision, dict) else None}}
+        by = decision.get("by") if isinstance(decision, dict) else None
+        _emit("approval", kind="purchase", approved=approved, by=by)
+        return {"approval": {"approved": approved, "by": by}}
 
     async def pay(state: State, config: RunnableConfig) -> dict:
         sid = state["checkout"]["session_id"]
@@ -325,7 +328,11 @@ def build_graph(deps: Deps, checkpointer=None):
             return {"messages": [AIMessage(f"The store declined the payment: {reason}. Nothing was charged.")],
                     "route": "done"}
         order = out["order"]
-        await deps.record_order(_thread(config), state["user"]["id"], order)
+        try:  # keep the ACP Order (items, totals, status), the shape the store's webhooks will update
+            snapshot = await deps.store.order(order["id"])
+        except StoreError:
+            snapshot = {"id": order["id"], "status": "created"}
+        await deps.record_order(_thread(config), state["user"]["id"], snapshot)
         _emit("order_placed", order_id=order["id"], amount=order.get("amount"))
         approved = state["checkout"]["total"]
         if order.get("amount") != approved:  # a card lets a merchant charge more than it showed
@@ -348,6 +355,10 @@ def build_graph(deps: Deps, checkpointer=None):
         except StoreError:
             pass  # an unpaid session simply expires; nothing was charged either way
         _emit("checkout_cancelled", session=sid)
+        if (state.get("approval") or {}).get("by") == "expired":
+            return {"messages": [AIMessage("That purchase card expired before it was approved, so I cancelled the "
+                                           "checkout. Nothing was charged. Ask me again if you still want it.")],
+                    "route": "done"}
         return {"messages": [AIMessage("OK, I cancelled that checkout. Nothing was charged.")], "route": "done"}
 
     # ---- refunds: the agent requests, an operator approves ------------------------------------------
@@ -370,6 +381,8 @@ def build_graph(deps: Deps, checkpointer=None):
         paid = next((t["amount"] for t in order.get("totals", []) if t["type"] == "total"), 0)
         refunded = next((t["amount"] for t in order.get("totals", []) if t["type"] == "amount_refunded"), 0)
         left = paid - refunded
+        if left <= 0:
+            return back("nothing is left to refund on this order")
         if amount is not None and (isinstance(amount, bool) or not isinstance(amount, int) or not 0 < amount <= left):
             return back(f"amount_cents must be between 1 and {left}")
         request = {"order_id": order_id, "amount": amount or left, "reason": reason, "user": state["user"].get("name"),
@@ -394,8 +407,17 @@ def build_graph(deps: Deps, checkpointer=None):
             note = state["approval"].get("note")
             return {"messages": [AIMessage("The store declined the refund" + (f": {note}" if note else ".") )],
                     "refund": None, "route": "done"}
+        key = f"refund:{_thread(config)}:{r['call_id']}"
+        whole = r["amount"] == r["paid"] - r["already_refunded"]
         try:
-            out = await deps.store.refund(r["order_id"], r["amount"], key=f"refund:{_thread(config)}:{r['call_id']}")
+            if whole and r.get("order_status") == "created":
+                # nothing has shipped: a full refund is a cancellation, so the order can't ship afterwards
+                await deps.store.cancel_order(r["order_id"], key=key)
+                _emit("refunded", order_id=r["order_id"], amount=r["amount"], canceled=True)
+                return {"messages": [AIMessage(f"Order {r['order_id']} is canceled and {_money(r['amount'])} is "
+                                               "refunded to your original payment method.")],
+                        "refund": None, "route": "done"}
+            out = await deps.store.refund(r["order_id"], r["amount"], key=key)
         except StoreError as exc:
             _emit("refund_error", code=exc.code)
             return {"messages": [AIMessage(f"The store approved the refund, but it failed ({exc.code}): {exc}.")],
@@ -518,6 +540,7 @@ def _order_summary(order: dict) -> dict:
     totals = {t["type"]: t["amount"] for t in order.get("totals", [])}
     return {"id": order["id"], "status": order.get("status"), "total": totals.get("total"),
             "refunded": totals.get("amount_refunded", 0),
+            "refundable": (totals.get("total") or 0) - totals.get("amount_refunded", 0),
             "items": [f"{li['title']} x{li['quantity']['ordered']}" for li in order.get("line_items", [])],
             "tracking": [f.get("tracking_number") for f in order.get("fulfillments", []) if f.get("tracking_number")]}
 

@@ -112,11 +112,21 @@ class AssistantDB:
                + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created DESC LIMIT 200")
         return await self._all(sql, tuple(args))
 
-    async def decide(self, approval_id: str, approved: bool, by: str, note: str = "") -> dict | None:
-        """Record a decision once. Returns the approval, or None if it was not pending (already decided)."""
+    async def decide(self, approval_id: str, approved: bool, by: str, note: str = "",
+                     max_age_s: float | None = None) -> dict | None:
+        """Record a decision once. Returns the approval, or None if it was not pending (already decided,
+        or older than ``max_age_s``, in which case it stays pending for the sweeper to expire)."""
+        age = "" if max_age_s is None else " AND created > now() - make_interval(secs => %s)"
+        args = ("approved" if approved else "declined", by, note[:300], approval_id) + (() if max_age_s is None else (max_age_s,))
         return await self._one("UPDATE approvals SET status = %s, decided_by = %s, note = %s, decided = now() "
-                               "WHERE id = %s AND status = 'pending' RETURNING id, thread_id, kind, actor, payload",
-                               ("approved" if approved else "declined", by, note[:300], approval_id))
+                               "WHERE id = %s AND status = 'pending'" + age +
+                               " RETURNING id, thread_id, kind, actor, payload", args)
+
+    async def expire(self, kind: str, max_age_s: float) -> list[dict]:
+        """Mark pending approvals of ``kind`` older than ``max_age_s`` as expired; returns them."""
+        return await self._all("UPDATE approvals SET status = 'expired', decided_by = 'expiry', decided = now() "
+                               "WHERE kind = %s AND status = 'pending' AND created < now() - make_interval(secs => %s) "
+                               "RETURNING id, thread_id", (kind, max_age_s))
 
     # ---- orders ------------------------------------------------------------------------------
     async def add_order(self, order_id: str, thread_id: str, user_id: str, data: dict) -> None:

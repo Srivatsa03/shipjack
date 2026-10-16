@@ -98,6 +98,9 @@ class StoreClient:
     async def deliver(self, order_id: str, key: str) -> dict:
         return await self._send("POST", f"/orders/{order_id}/deliver", {}, key=key, operator=True)
 
+    async def cancel_order(self, order_id: str, key: str) -> dict:
+        return await self._send("POST", f"/orders/{order_id}/cancel", {}, key=key, operator=True)
+
     async def refund(self, order_id: str, amount: int | None, key: str) -> dict:
         body = {} if amount is None else {"amount": amount}
         return await self._send("POST", f"/orders/{order_id}/refund", body, key=key, operator=True)

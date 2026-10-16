@@ -53,6 +53,8 @@ class Settings:
     webhook_secret: bytes = b""                        # shared with the store; empty disables the webhook route
     origins: list[str] = field(default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"])
     schema: str = "assistant"
+    purchase_ttl_s: float = 15 * 60                    # a purchase card can be approved for this long
+    sweep_every_s: float = 30.0
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -127,9 +129,11 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
         else:
             deps.orders_for, deps.record_order = db.order_ids, _recorder(db)
         state.update(db=db, graph=build_graph(deps, checkpointer=saver), deps=deps)
+        sweeper = asyncio.create_task(sweep())
         try:
             yield
         finally:
+            sweeper.cancel()
             for task in list(state["tasks"]):
                 task.cancel()
             await pool.close()
@@ -198,6 +202,17 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
                 yield _sse("error", {"message": "something went wrong; nothing was charged without your approval"})
             await store.touch(thread_id)
             yield _sse("done", {"run_id": run_id})
+
+    async def sweep() -> None:
+        """Expire purchase cards nobody answered in time, and cancel their checkouts (like a payment sheet
+        that times out), so an old card can never be approved later."""
+        while True:
+            await asyncio.sleep(settings.sweep_every_s)
+            try:
+                for stale in await db().expire("purchase", settings.purchase_ttl_s):
+                    await resume_in_background(stale["thread_id"], {"approved": False, "by": "expired"})
+            except Exception:  # noqa: BLE001 - the sweeper must keep running
+                log.exception("approval sweep failed")
 
     def stream(gen) -> StreamingResponse:
         return StreamingResponse(gen, media_type="text/event-stream",
@@ -269,8 +284,8 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
         pending = {a["id"]: a for a in await db().approvals(status="pending", thread_id=thread_id, actor="shopper")}
         if approval_id not in pending:
             raise HTTPException(404, "no pending approval with that id")
-        if await db().decide(approval_id, approved, u["id"]) is None:
-            raise HTTPException(409, "already decided")
+        if await db().decide(approval_id, approved, u["id"], max_age_s=settings.purchase_ttl_s) is None:
+            raise HTTPException(409, "this approval was already decided or has expired; ask the assistant again")
         return stream(run(thread_id, Command(resume={"approved": approved, "by": u["id"]})))
 
     @app.get("/api/threads/{thread_id}/events")

@@ -240,7 +240,8 @@ async def test_a_refund_waits_for_an_operator_then_returns_the_money():
     assert ask["kind"] == "refund" and ask["actor"] == "operator" and ask["amount"] == 3499
     assert shop.world.processor.charges[0].refunded == 0  # nothing moves before the operator decides
     out = await shop.resume({"approved": True, "by": "ops"})
-    assert "Refunded $34.99" in shop.last(out) and shop.world.processor.charges[0].refunded == 3499
+    assert "canceled and $34.99 is refunded" in shop.last(out) and shop.world.processor.charges[0].refunded == 3499
+    assert shop.merchant.acp_order("ord_cs_northwind_1")["status"] == "canceled"  # unshipped: canceled, not shippable
 
 
 async def test_an_operator_can_decline_a_refund():
@@ -363,3 +364,35 @@ def test_sanitize_answers_or_drops_every_tool_call():
     out = sanitize(msgs)
     assert [m.type for m in out] == ["human", "ai", "tool", "ai"]
     assert out[1].tool_calls and not out[3].tool_calls and out[3].content == "hmm"
+
+
+async def test_a_refund_on_an_order_with_nothing_left_is_refused():
+    """Found live: "refund all that's left" on a fully refunded order asked an operator for $0.00."""
+    shop = await purchased([say("support"), call("request_refund", {"order_id": "ord_cs_northwind_1", "reason": "x"}),
+                            say("That order was already refunded.")])
+    shop.merchant.refund_order("ord_cs_northwind_1")
+    out = await shop.say("refund my hub")
+    refused = [m for m in out["messages"] if m.type == "tool"][-1]
+    assert "nothing is left to refund" in refused.content and not await shop.pending()
+
+
+async def test_orders_are_listed_newest_first_with_what_is_refundable():
+    shop = Shop(buy_hub_script() + [say("shop"), call("propose_purchase", {"product_id": GIFT.id}),
+                                    say("support"), call("list_my_orders", {}), say("ok")])
+    await shop.say("buy a hub")
+    await shop.resume({"approved": True})
+    await shop.say("and a gift card")
+    await shop.resume({"approved": True})
+    shop.merchant.refund_order("ord_cs_northwind_1", 1000)
+    out = await shop.say("what did I order?")
+    listed = json.loads([m for m in out["messages"] if m.type == "tool"][-1].content)
+    assert [o["id"] for o in listed] == ["ord_cs_northwind_2", "ord_cs_northwind_1"]
+    assert listed[1]["refundable"] == 2499
+
+
+async def test_a_partial_or_post_shipping_refund_does_not_cancel():
+    shop = await purchased([say("support"), call("request_refund", {"order_id": "ord_cs_northwind_1", "reason": "scratched"})])
+    shop.merchant.fulfill_order("ord_cs_northwind_1", carrier="USPS")
+    await shop.say("it came scratched, refund it")
+    out = await shop.resume({"approved": True})
+    assert "Refunded $34.99" in shop.last(out) and shop.merchant.acp_order("ord_cs_northwind_1")["status"] == "shipped"
