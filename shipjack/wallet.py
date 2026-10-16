@@ -28,7 +28,8 @@ from ap2.sdk.jwt_helper import verify_jwt
 from jwcrypto.jwk import JWK
 
 from .keys import new_key, public
-from .mandates import (FULFILLMENT, OpenCheckoutMandateExt, digest, evaluate_checkout, evaluate_payment, jwt_payload,
+from .mandates import (FULFILLMENT, OpenCheckoutMandateExt, checkout_inconsistencies, digest, evaluate_checkout,
+                       evaluate_payment, jwt_payload,
                        open_payload, present)
 from .merchant import CheckoutError, Merchant
 from .psp import CP_AUDIENCE, Card, CredentialProvider, PaymentError
@@ -126,6 +127,7 @@ class Wallet:
                 verify_jwt(checkout_jwt, key)
             except Exception:
                 problems.append(f"checkout is not signed by {merchant_id}'s published key")
+        problems += [f"checkout totals do not add up ({x[len('checkout: '):]})" for x in checkout_inconsistencies(checkout)]
         ts_key = self.surface.verification_key()
         problems += evaluate_checkout(open_payload(self.delegation.open_checkout, ts_key, OpenCheckoutMandateExt),
                                       checkout_jwt, {FULFILLMENT})

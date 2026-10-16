@@ -34,6 +34,8 @@ SDK_PAYMENT_TYPES = {"payment.amount_range", "payment.allowed_payees", "payment.
                      "payment.allowed_pisps", "payment.budget", "payment.agent_recurrence", "payment.reference",
                      "payment.execution_date"}
 
+MAX_OPEN_LIFETIME = 24 * 3600  # AP2 recommends the shortest expiry that fits the task; this deployment caps it at a day
+
 client = MandateClient()
 
 
@@ -130,6 +132,54 @@ def open_token_of(chain_token: str) -> str:
     return chain_token.split("~~", 1)[0] + "~"
 
 
+def open_policy(open_raw: dict) -> list[str]:
+    """Deployment policy on an open mandate: it must expire, and not later than a day after it was issued."""
+    exp, iat = open_raw.get("exp"), open_raw.get("iat")
+    if isinstance(exp, bool) or not isinstance(exp, int):
+        return ["invalid_mandate: open mandate has no expiry"]
+    if isinstance(iat, bool) or not isinstance(iat, int):
+        return ["invalid_mandate: open mandate has no issue time"]
+    if exp - iat > MAX_OPEN_LIFETIME:
+        return [f"invalid_mandate: open mandate lives longer than {MAX_OPEN_LIFETIME // 3600} hours"]
+    return []
+
+
+def checkout_inconsistencies(checkout: dict) -> list[str]:
+    """Does a merchant-signed checkout add up? A signature proves who said it, not that it is right.
+
+    Each line's total is unit price x quantity, the subtotal is the sum of the lines, and with no
+    shipping, tax, fee or discount entries the total is the subtotal. Totals are never negative.
+    """
+    out = []
+    if not str(checkout.get("currency") or "").strip():
+        out.append("checkout: no currency")
+    lines = checkout.get("line_items")
+    if not isinstance(lines, list) or not lines:
+        return out + ["checkout: no line items"]
+    line_sum = 0
+    for li in lines:
+        item, qty = (li.get("item") or {}), li.get("quantity")
+        price = item.get("price")
+        total = next((x.get("amount") for x in li.get("totals", []) if x.get("type") == "total"), None)
+        if isinstance(qty, bool) or not isinstance(qty, int) or qty < 1:
+            out.append(f"checkout: line {li.get('id')} has a bad quantity")
+        elif isinstance(price, bool) or not isinstance(price, int) or total != price * qty:
+            out.append(f"checkout: line {li.get('id')} total is not unit price x quantity")
+        line_sum += total if isinstance(total, int) and not isinstance(total, bool) else 0
+    entries = {x.get("type"): x.get("amount") for x in checkout.get("totals", []) if isinstance(x, dict)}
+    total, subtotal = entries.get("total"), entries.get("subtotal")
+    if not isinstance(total, int) or isinstance(total, bool):
+        return out + ["checkout: no total"]
+    if total < 0:
+        out.append("checkout: negative total")
+    if subtotal is not None and subtotal != line_sum:
+        out.append("checkout: subtotal is not the sum of the lines")
+    extras = set(entries) - {"subtotal", "total"}
+    if not extras and total != line_sum:
+        out.append("checkout: total does not add up to the lines")
+    return out
+
+
 def evaluate_checkout(open_payload: dict, checkout_jwt: str, supported: set[str] = frozenset()) -> list[str]:
     """Evaluate every constraint of an open Checkout Mandate against a checkout. Unknown types fail."""
     sdk, ext, violations = _split(open_payload.get("constraints", []), SDK_CHECKOUT_TYPES, supported)
@@ -166,7 +216,7 @@ def verify_checkout(token: str, trust: TrustList, *, aud: str, nonce: str, check
         violations.append("invalid_mandate: the mandate approves a different checkout than the current one")
     if closed.checkout_hash != digest(checkout_jwt):
         violations.append("invalid_mandate: checkout_hash does not match the current checkout")
-    return closed, violations + evaluate_checkout(open_raw, checkout_jwt, supported)
+    return closed, violations + open_policy(open_raw) + evaluate_checkout(open_raw, checkout_jwt, supported)
 
 
 def verify_payment(token: str, trust: TrustList, *, aud: str, nonce: str, open_checkout_hash: str | None,
@@ -180,7 +230,7 @@ def verify_payment(token: str, trust: TrustList, *, aud: str, nonce: str, open_c
         closed = PaymentMandate.model_validate(closed_raw)
     except Exception as exc:
         return None, [f"invalid_mandate: {exc}"]
-    return closed, evaluate_payment(open_raw, closed, open_checkout_hash, context)
+    return closed, open_policy(open_raw) + evaluate_payment(open_raw, closed, open_checkout_hash, context)
 
 
 def open_payload(token: str, key: JWK, model: type[BaseModel]) -> dict:

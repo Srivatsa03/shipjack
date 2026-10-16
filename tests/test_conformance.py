@@ -149,7 +149,10 @@ def test_an_unknown_constraint_fails_closed(world):
         constraints: list[Mystery]
 
     r = Rig(world)
-    open_token = sign_open(world.surface.key, OpenWithMystery(constraints=[Mystery()], cnf=cnf(r.agent_key)))
+    import time
+    now = int(time.time())
+    open_token = sign_open(world.surface.key, OpenWithMystery(constraints=[Mystery()], cnf=cnf(r.agent_key),
+                                                              iat=now, exp=now + 3600))
     token = close(r.agent_key, open_token, CheckoutMandate(checkout_jwt=r.checkout_jwt, checkout_hash=digest(r.checkout_jwt)),
                   aud=r.aud, nonce=r.nonce)
     _, v = r.verify_checkout(token)
@@ -339,3 +342,84 @@ def test_a_token_pays_only_its_payee(world):
     with pytest.raises(PaymentError, match="not account"):
         world.processor.charge_token(world.merchants["bluebird"].account, token, r.total, "USD",
                                      digest(r.checkout_jwt), r.deleg.open_checkout_hash)
+
+
+# ---- lifetime policy: AP2 only recommends a short expiry; this deployment requires one --------------
+
+
+def _open_without_expiry(world, agent_key):
+    from ap2.sdk.generated.open_checkout_mandate import OpenCheckoutMandate
+    from shipjack.keys import cnf
+    from shipjack.mandates import sign_open
+    return sign_open(world.surface.key, OpenCheckoutMandate(constraints=[], cnf=cnf(agent_key)))
+
+
+def test_an_open_mandate_that_lives_for_ten_days_is_refused(world):
+    r = Rig(world, lifetime=10 * 24 * 3600)
+    for check in (r.verify_checkout(r.checkout_mandate())[1], r.verify_payment(r.payment_mandate())[1]):
+        assert check and "longer than 24 hours" in check[0], check
+
+
+def test_a_day_is_the_limit_and_a_day_is_fine(world):
+    r = Rig(world, lifetime=24 * 3600)
+    assert r.verify_checkout(r.checkout_mandate())[1] == [] and r.verify_payment(r.payment_mandate())[1] == []
+
+
+def test_an_open_mandate_with_no_expiry_is_refused(world):
+    from ap2.sdk.generated.checkout_mandate import CheckoutMandate
+    from shipjack.mandates import present as close
+    r = Rig(world)
+    open_token = _open_without_expiry(world, r.agent_key)
+    token = close(r.agent_key, open_token, CheckoutMandate(checkout_jwt=r.checkout_jwt, checkout_hash=digest(r.checkout_jwt)),
+                  aud=r.aud, nonce=r.nonce)
+    _, v = r.verify_checkout(token)
+    assert any("no expiry" in x for x in v), v
+
+
+# ---- a signed checkout has to add up -------------------------------------------------------------
+
+
+def make_checkout(**changes):
+    base = {"id": "cs_1", "merchant": {"id": "m", "name": "M"}, "status": "ready_for_complete", "currency": "USD",
+            "line_items": [{"id": "li_1", "item": {"id": "a", "title": "A", "price": 1000}, "quantity": 2,
+                            "totals": [{"type": "subtotal", "amount": 2000}, {"type": "total", "amount": 2000}]}],
+            "totals": [{"type": "subtotal", "amount": 2000}, {"type": "total", "amount": 2000}]}
+    base.update(changes)
+    return base
+
+
+def test_an_honest_checkout_adds_up():
+    from shipjack.mandates import checkout_inconsistencies
+    assert checkout_inconsistencies(make_checkout()) == []
+
+
+@pytest.mark.parametrize("changes, reason", [
+    ({"totals": [{"type": "subtotal", "amount": 2000}, {"type": "total", "amount": 2500}]}, "total"),
+    ({"totals": [{"type": "subtotal", "amount": 1900}, {"type": "total", "amount": 1900}]}, "subtotal"),
+    ({"totals": [{"type": "subtotal", "amount": 2000}]}, "no total"),
+    ({"totals": []}, "no total"),
+    ({"totals": [{"type": "subtotal", "amount": 2000}, {"type": "total", "amount": -5}]}, "negative"),
+    ({"line_items": []}, "no line items"),
+    ({"line_items": [{"id": "li_1", "item": {"id": "a", "title": "A", "price": 1000}, "quantity": 2,
+                      "totals": [{"type": "subtotal", "amount": 1000}, {"type": "total", "amount": 1000}]}]}, "line"),
+    ({"line_items": [{"id": "li_1", "item": {"id": "a", "title": "A", "price": 1000}, "quantity": 0,
+                      "totals": [{"type": "total", "amount": 0}]}]}, "quantity"),
+    ({"currency": ""}, "currency"),
+])
+def test_a_checkout_that_does_not_add_up_is_named(changes, reason):
+    from shipjack.mandates import checkout_inconsistencies
+    out = checkout_inconsistencies(make_checkout(**changes))
+    assert out and all(x.startswith("checkout:") for x in out), (reason, out)
+
+
+def test_the_wallet_refuses_to_sign_a_checkout_whose_total_is_not_its_lines(world, monkeypatch):
+    merchant = world.merchants["northwind"]
+    real = merchant._ucp_checkout
+    monkeypatch.setattr(merchant, "_ucp_checkout", lambda s: {**real(s), "totals": [
+        {"type": "subtotal", "amount": 3499}, {"type": "total", "amount": 3999}]})  # 5.00 more than the lines
+    from conftest import HOME, hub_intent
+    session = merchant.create_session([{"id": HUB.id}], fulfillment_details={"address": HOME})
+    guarded = world.wallet("ap2+ext", hub_intent(world))
+    out = guarded.pay(merchant, session["id"])
+    assert out["status"] == "declined" and out["stage"] == "wallet" and "add up" in out["message"]
+    assert world.credentials.log == []  # nothing was signed or presented

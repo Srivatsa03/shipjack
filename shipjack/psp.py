@@ -7,6 +7,7 @@ account was paid and how much, whatever any agent or merchant claims happened.
 from __future__ import annotations
 
 import secrets
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -58,9 +59,14 @@ class Processor:
     registered: dict[str, str] = field(default_factory=dict)  # account -> merchant id it was onboarded as
     credentials: CredentialProvider | None = None
     binds_payee: bool = True  # pay out only if the token's payee is the account's onboarded identity
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)  # "unused" and "mark used" are one step
 
     def charge_card(self, account: str, card_number: str, amount: int, currency: str, reference: str) -> Charge:
         """A raw card number authorizes any amount for anyone who holds it. That is the baseline."""
+        with self._lock:
+            return self._charge_card(account, card_number, amount, currency, reference)
+
+    def _charge_card(self, account: str, card_number: str, amount: int, currency: str, reference: str) -> Charge:
         if not self.credentials or card_number != self.credentials.card.number:
             raise PaymentError("payment_declined", "card number not recognised")
         charge = Charge(account, amount, currency, "card", reference)
@@ -70,6 +76,11 @@ class Processor:
     def charge_token(self, account: str, token: str, amount: int, currency: str, transaction_id: str,
                      open_checkout_hash: str | None = None) -> Charge:
         """An AP2 token pays one checkout, for its approved amount, to its approved payee, once."""
+        with self._lock:
+            return self._charge_token(account, token, amount, currency, transaction_id, open_checkout_hash)
+
+    def _charge_token(self, account: str, token: str, amount: int, currency: str, transaction_id: str,
+                      open_checkout_hash: str | None = None) -> Charge:
         scope = self.credentials.redeem(token) if self.credentials else None
         if scope is None:
             raise PaymentError("payment_declined", "unknown or already used payment token")
@@ -102,13 +113,19 @@ class CredentialProvider:
     _tokens: dict[str, _Scope] = field(default_factory=dict)
     _usage: dict[str, MandateContext] = field(default_factory=dict)  # open payment mandate -> spend so far
     log: list[dict] = field(default_factory=list)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def nonce(self) -> str:
         value = secrets.token_urlsafe(16)
-        self._nonces.add(value)
+        with self._lock:
+            self._nonces.add(value)
         return value
 
     def issue(self, payment_mandate: str, nonce: str, open_checkout_hash: str | None) -> str:
+        with self._lock:  # a nonce is spent and a token is minted as one step
+            return self._issue(payment_mandate, nonce, open_checkout_hash)
+
+    def _issue(self, payment_mandate: str, nonce: str, open_checkout_hash: str | None) -> str:
         if nonce not in self._nonces:
             raise PaymentError("invalid_credential", "unknown or already used nonce")
         self._nonces.discard(nonce)

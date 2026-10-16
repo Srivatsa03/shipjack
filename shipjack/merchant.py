@@ -11,7 +11,9 @@ another merchant's identity in its checkouts, or charges more at completion than
 
 from __future__ import annotations
 
+import functools
 import secrets
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -26,6 +28,15 @@ from .psp import PaymentError, Processor
 
 ACP_API_VERSION = "2026-04-17"
 MAX_QUANTITY = 1000  # per line; a store caps what one order can ask for
+
+
+def _locked(method):
+    """Run a public Merchant method with the merchant's lock held: one request changes a session at a time."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class CheckoutError(Exception):
@@ -69,6 +80,7 @@ class Merchant:
         self.orders: list[dict] = []
         self.receipts: list[dict] = []
         self._count = 0
+        self._lock = threading.RLock()
 
     @property
     def id(self) -> str:
@@ -90,6 +102,7 @@ class Merchant:
         return self.products[product_id].page()
 
     # ---- ACP checkout sessions -------------------------------------------------------------------
+    @_locked
     def create_session(self, items: list[dict], fulfillment_details: dict | None = None,
                        buyer: dict | None = None) -> dict:
         details, buyer = self._details(fulfillment_details), self._buyer(buyer)
@@ -99,6 +112,7 @@ class Merchant:
         self.sessions[session.id] = session
         return self._render(self._refresh(session))
 
+    @_locked
     def update_session(self, session_id: str, items: list[dict] | None = None,
                        fulfillment_details: dict | None = None, buyer: dict | None = None) -> dict:
         session = self._open(session_id)
@@ -117,6 +131,7 @@ class Merchant:
     def get_session(self, session_id: str) -> dict:
         return self._render(self._session(session_id))
 
+    @_locked
     def cancel_session(self, session_id: str) -> dict:
         session = self._session(session_id)
         if session.status in ("completed", "canceled"):
@@ -124,6 +139,7 @@ class Merchant:
         session.status, session.checkout_jwt, session.nonce = "canceled", None, None
         return self._render(session)
 
+    @_locked
     def complete_session(self, session_id: str, payment_data: dict) -> dict:
         session = self._open(session_id)
         if session.status != "ready_for_payment":
@@ -162,6 +178,7 @@ class Merchant:
         return out
 
     # ---- AP2 -------------------------------------------------------------------------------------
+    @_locked
     def ap2_checkout(self, session_id: str) -> dict:
         """Sign the current cart as a UCP Checkout JWT and issue a single-use nonce for its approval."""
         session = self._open(session_id)
