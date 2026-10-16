@@ -55,7 +55,7 @@ shipjack-assistant = "shipjack.assistant.api:main"
 packages = ["shipjack", "shipjack.assistant"]
 
 [tool.setuptools.package-data]
-shipjack = ["data/*.md"]
+shipjack = ["data/*.md", "data/*.csv", "data/*.jsonl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
