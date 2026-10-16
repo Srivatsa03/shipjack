@@ -24,6 +24,19 @@
   fails closed, as the spec requires, so the extension only works where the merchant (or the
   agent's wallet) supports it.
 
+## Of human-present mode and MCP
+
+- **The direct approval is modelled as a compact user-signed JWT** over the exact checkout and payment,
+  not as an SD-JWT presented through OpenID4VP `transaction_data`. The binding it proves (this
+  merchant, nonce, checkout and amount, signed by a trusted user key) is the same; the envelope is
+  simpler.
+- **The user and the screen are simulated.** A real user is slower, skims, and trusts urgent-sounding
+  notices. "A careful user catches what the screen shows" is an upper bound on a present human, not a
+  measurement of one.
+- **The MCP server implements the core JSON-RPC methods** (`initialize`, `tools/list`, `tools/call`,
+  `ping`) over newline-delimited stdio. It is not a full MCP implementation (no resources, prompts,
+  subscriptions, or Streamable HTTP), and it has not been run against a third-party MCP client.
+
 ## Of the hardening
 
 - **Locks are in-process.** The merchant, processor and credential provider serialise their

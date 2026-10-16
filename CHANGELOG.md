@@ -2,6 +2,18 @@
 
 ## 0.1.0 (unreleased)
 
+### Added
+
+- **Human-present (Direct) mode** (`shipjack/direct.py`): the user signs each purchase on a trusted
+  surface after reading an approval screen. Shows that AP2's example screen omits the destination, so a
+  careful user cannot catch a ship-to or gift-card-email redirect unless the screen is extended to show
+  it. Merchant handler `direct`, a user-signed approval bound to the merchant, nonce, checkout and
+  amount, single-use and expiring.
+- **MCP store** (`shipjack/mcp.py`, `shipjack-mcp`): the store as an MCP server following the ACP MCP
+  binding (five checkout tools, `{meta, id?, payload?}`, idempotency in `meta`), over a dependency-free
+  JSON-RPC 2.0 stdio loop, plus discovery and product/AP2 extension tools. A purchase over MCP reaches
+  the same outcome as over the in-process API.
+
 ### Hardening (found by the edge-case tests)
 
 - Mailboxes in the fulfillment check were compared with every dot removed, so a mailbox on another

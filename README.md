@@ -173,6 +173,27 @@ The last two are this project's convention: AP2 leaves the binding to the commer
 - ACP: [agentic-commerce-protocol](https://github.com/agentic-commerce-protocol/agentic-commerce-protocol),
   API version `2026-04-17`.
 
+## Human-present mode
+
+In AP2's Direct mode the user signs each purchase on a trusted surface instead of signing open
+constraints up front. `shipjack/direct.py` renders an approval screen, a careful user signs or
+declines by reading only what the screen shows, and the user-signed approval is what the merchant
+verifies (handler `direct`).
+
+The finding carries over: AP2's example approval screen shows the merchant, the amount and the items,
+and no destination. With that screen a present, careful user signs a ship-to or gift-card-email
+redirect they never see. With a screen that also shows the destination, the same user declines. So
+human approval does not close the delivery gap unless the screen shows where the goods go.
+
+## Over MCP
+
+The store also speaks the [ACP MCP binding](https://github.com/agentic-commerce-protocol/agentic-commerce-protocol):
+the five checkout operations as MCP tools (`create/get/update/complete/cancel_checkout_session`),
+called with `{meta, id?, payload?}`, over a JSON-RPC 2.0 stdio server with no extra dependency. Three
+tools beyond the binding (`search_products`, `get_product`, `get_ap2_checkout`) let an agent discover
+products and fetch a signed checkout. Run it with `shipjack-mcp`. A purchase over MCP reaches the same
+place as over the in-process API, so the delivery finding does not depend on the transport.
+
 ## How it is tested
 
 276 tests, run in CI on Python 3.11 and 3.12. They break one input at a time, so a refusal always points

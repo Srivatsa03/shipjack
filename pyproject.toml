@@ -39,6 +39,7 @@ Repository = "https://github.com/Srivatsa03/shipjack"
 
 [project.scripts]
 shipjack = "shipjack.cli:main"
+shipjack-mcp = "shipjack.mcp:main"
 
 [tool.setuptools]
 packages = ["shipjack"]
