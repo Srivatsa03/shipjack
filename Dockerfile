@@ -1,6 +1,6 @@
-# One image for both Python services; the command picks which one runs:
-#   store:     shipjack-serve --host 0.0.0.0 --port $PORT
-#   assistant: shipjack-assistant --host 0.0.0.0 --port $PORT
+# One image for both Python services; SHIPJACK_SERVICE picks which one start.sh runs:
+#   SHIPJACK_SERVICE=store      shipjack-serve on $PORT (the default)
+#   SHIPJACK_SERVICE=assistant  shipjack-assistant on $PORT
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -22,9 +22,10 @@ RUN python -c "from model2vec import StaticModel; StaticModel.from_pretrained('m
 # Then the code (seconds to rebuild).
 COPY shipjack ./shipjack
 RUN pip install --no-deps .
+COPY start.sh /app/start.sh
 
 RUN useradd --create-home app && chown -R app /opt/models
 USER app
 
 EXPOSE 8000
-CMD ["sh", "-c", "shipjack-serve --host 0.0.0.0 --port ${PORT}"]
+CMD ["/app/start.sh"]

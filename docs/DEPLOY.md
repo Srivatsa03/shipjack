@@ -46,17 +46,20 @@ Keep the string to yourself: paste it into Render in the next step, not into a c
 2. **New > Blueprint**, pick `Srivatsa03/shipjack`. Render reads `render.yaml` and lists two services,
    `shipjack-store` and `shipjack-assistant`, and the group `shipjack-shared`.
 3. Fill in what it asks for:
-   - `SHIPJACK_DB`: the Neon string from step 2.
    - `GROQ_API_KEY`: copy it from the Keychain without showing it:
      `security find-generic-password -a "$USER" -s groq-api-key -w | pbcopy`, then paste.
    - `SHIPJACK_WEBHOOK_URL`, `SHIPJACK_STORE_URL`, `SHIPJACK_WEB_ORIGINS`: type `https://pending` for
      now; the real addresses exist only after the first deploy.
-4. **Apply**. The first build takes about 10 minutes.
-5. When both services are live, each has an address like `https://shipjack-store-xxxx.onrender.com`.
+4. **Apply**. The first build takes 10 to 15 minutes. The assistant's first start fails until the
+   next step gives it a database.
+5. **Environment Groups > shipjack-shared > Edit > Add**: key `SHIPJACK_DB`, value the Neon string
+   from step 2. Save with **Save, rebuild, and deploy**. (A blueprint doesn't create an empty value in
+   a shared group, so this one is added by hand. Add it as an environment variable, not a secret file.)
+6. When both services are live, each has an address like `https://shipjack-store.onrender.com`.
    Set, in each service's **Environment** tab:
    - store: `SHIPJACK_WEBHOOK_URL` = `https://<assistant address>/api/webhooks/orders`
    - assistant: `SHIPJACK_STORE_URL` = `https://<store address>`
-6. Check: `https://<assistant address>/api/health` answers `{"ok":true,"demo":true,...}`.
+7. Check: `https://<assistant address>/api/health` answers `{"ok":true,"demo":true,...}`.
 
 ## 4. Vercel (the web app)
 

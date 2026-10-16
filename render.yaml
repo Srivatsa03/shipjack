@@ -1,6 +1,9 @@
-# Render blueprint: the store and the assistant, from one Docker image (Dockerfile).
-# Create it in the Render dashboard: New > Blueprint > pick this repo. Render asks for every
-# value marked "sync: false"; docs/DEPLOY.md says what goes in each.
+# Render blueprint: the store and the assistant, from one Docker image (Dockerfile); SHIPJACK_SERVICE
+# picks which one /app/start.sh runs. (A start command with quotes in it reaches the container with
+# the quotes still on, so the command is one plain path.)
+# Create it in the Render dashboard: New > Blueprint > pick this repo. Render asks for the service
+# values marked "sync: false"; SHIPJACK_DB in the shared group you add by hand afterwards
+# (a blueprint doesn't create an empty group value). docs/DEPLOY.md has the steps.
 envVarGroups:
   - name: shipjack-shared
     envVars:
@@ -19,10 +22,12 @@ services:
     runtime: docker
     plan: free
     dockerfilePath: ./Dockerfile
-    dockerCommand: sh -c "shipjack-serve --host 0.0.0.0 --port $PORT"
+    dockerCommand: /app/start.sh
     healthCheckPath: /.well-known/acp.json
     envVars:
       - fromGroup: shipjack-shared
+      - key: SHIPJACK_SERVICE
+        value: store
       - key: SHIPJACK_WEBHOOK_URL     # https://<the assistant's onrender.com address>/api/webhooks/orders
         sync: false
       - key: SHIPJACK_CATALOG
@@ -35,10 +40,12 @@ services:
     runtime: docker
     plan: free
     dockerfilePath: ./Dockerfile
-    dockerCommand: sh -c "shipjack-assistant --host 0.0.0.0 --port $PORT"
+    dockerCommand: /app/start.sh
     healthCheckPath: /api/health
     envVars:
       - fromGroup: shipjack-shared
+      - key: SHIPJACK_SERVICE
+        value: assistant
       - key: SHIPJACK_STORE_URL       # https://<the store's onrender.com address>
         sync: false
       - key: SHIPJACK_WEB_ORIGINS     # https://<your Vercel address>

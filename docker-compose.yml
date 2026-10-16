@@ -27,8 +27,9 @@ services:
   store:
     build: .
     profiles: [app]
-    command: ["sh", "-c", "shipjack-serve --host 0.0.0.0 --port 8000"]
     environment:
+      SHIPJACK_SERVICE: store
+      PORT: "8000"
       SHIPJACK_DB: postgresql://shipjack:${SHIPJACK_PG_PASSWORD:-shipjack-dev}@db:5432/shipjack
       SHIPJACK_WEBHOOK_URL: http://assistant:8200/api/webhooks/orders
       SHIPJACK_WEBHOOK_ALLOW_HTTP: "1"   # the compose network is private
@@ -43,8 +44,9 @@ services:
   assistant:
     build: .
     profiles: [app]
-    command: ["sh", "-c", "shipjack-assistant --host 0.0.0.0 --port 8200"]
     environment:
+      SHIPJACK_SERVICE: assistant
+      PORT: "8200"
       SHIPJACK_DB: postgresql://shipjack:${SHIPJACK_PG_PASSWORD:-shipjack-dev}@db:5432/shipjack
       SHIPJACK_STORE_URL: http://store:8000
       SHIPJACK_WEBHOOK_SECRET: ${SHIPJACK_WEBHOOK_SECRET:-local-only-webhook-secret-change-me-32b}
