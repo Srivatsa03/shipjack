@@ -4,6 +4,20 @@
 
 ### Added
 
+- **Shopping assistant** (`shipjack/assistant`, `shipjack-assistant`): a LangGraph router and three agents
+  (shopping, support, chat) with least privilege, human approvals for purchases (shopper) and refunds
+  (store operator), model fallback, step budgets, an SSE API on Postgres (AsyncPostgresSaver), an event
+  log, approval expiry, and the store's signed webhooks.
+- **Web app** (`web/`, Next.js 16): a Liquid Glass shopper chat with an Apple Pay style approval sheet,
+  and a store console (refunds, orders, catalog and knowledge, conversation replay, health).
+- **Merchant onboarding and knowledge base**: Shopify export and CSV imports, policy pages, search by
+  meaning on pgvector (vector, keyword or weighted hybrid), MCP `search_store_docs`, a retrieval eval
+  (`shipjack retrieval-eval`, docs/RETRIEVAL.md). Orders keep the lines they were sold with.
+- **Postgres store backend** with the same guarantees as SQLite (advisory lock), tested in CI.
+- **MCP over Streamable HTTP** at the store's `POST /mcp`.
+- **Deployment**: a public demo mode (sandboxes, caps, no shared tokens), Dockerfiles, docker compose
+  for the whole stack, a Render blueprint, docs/DEPLOY.md.
+
 - **SQLite store** (`shipjack/store.py`, `shipjack-serve --db shop.db --workers N`, `build(..., db=)`):
   sessions, orders, receipts, the audit trail, idempotency answers, the webhook outbox, id counters,
   the checkout-signing key and the simulated processor's ledger in one WAL-mode file. Each merchant

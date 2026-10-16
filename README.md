@@ -12,6 +12,44 @@ agent calls, and Google's **Agent Payments Protocol (AP2, v0.2)** makes the user
 sign *mandates*: limits on what the agent may buy, from whom, and for how much. shipjack wires a
 merchant up to both.
 
+It ships as a full-stack app: the merchant's store (ACP + MCP), the merchant's own **AI shopping
+assistant** (LangGraph agents with human approvals), and a **web app** for shoppers and store
+operators, on Postgres. See [The app](#the-app) and [docs/DEPLOY.md](docs/DEPLOY.md).
+
+## The app
+
+```
+Next.js web app (Liquid Glass)          shopper chat, Apple Pay style approval, store console
+        │ SSE
+shipjack-assistant (FastAPI + LangGraph) router → shopping / support / chat agents
+        │ MCP (Streamable HTTP) + ACP REST      ▲ signed order webhooks
+shipjack-serve (the store)              checkout, payments, refunds, knowledge base (pgvector)
+        │
+Postgres + pgvector                     store state, conversation checkpoints, events
+```
+
+- **Agents with least privilege.** The shopping agent reads product pages (untrusted, an attacker can
+  write there) but has no payment tool and never sees the address; it can only propose a product and a
+  quantity. Checkout, payment and refunds are code. The support agent can only *request* a refund.
+- **People in the loop.** Every purchase stops at an approval sheet showing the item, the total and
+  where it ships; every refund waits for a store operator in the console. Purchase cards expire after
+  15 minutes. The platform checks the merchant's checkout against the proposal before showing the
+  card, and flags an overcharge after paying.
+- **Merchant onboarding.** Import a Shopify product export (or a simple CSV) and policy pages; the
+  store indexes them for search by meaning. A retrieval eval chose the search mode
+  ([docs/RETRIEVAL.md](docs/RETRIEVAL.md)): vector search found the right product first 90% of the
+  time and the right policy 85% (bge-small), against 55% for keyword search.
+- **Error handling.** Model fallback (Gemini, then Groq) logged in the timeline, retries with backoff,
+  idempotency keys so a lost response or a re-run pays once, a per-turn step budget, history repair
+  after a bad turn, a sweeper for stale approvals.
+- **Observability.** Every run is an event log: which agent ran, which model answered, tokens, latency,
+  tool calls, checks, approvals, webhooks. The console replays any conversation and shows health.
+- **A public demo mode.** A private sandbox per visitor, daily caps, no shared tokens, free models.
+
+```bash
+docker compose --profile app up --build          # http://localhost:3000, console at /console
+```
+
 ## What it integrates
 
 - **An agent-ready store.** ACP checkout sessions (create, update, complete, cancel) over two
@@ -37,8 +75,8 @@ merchant up to both.
   store without charging, refunding or numbering anything twice. Charges and refunds carry Stripe
   idempotency keys, so a retry after a crash pays once. Under load on one laptop: 40,000 purchases and
   16,000 racing payment attempts, 0 errors, 0 double charges ([results](docs/LOAD_RESULTS.md)).
-- **A safety suite.** 684 test cases that break one input at a time, so the integration can be shipped
-  with evidence, not hope. It is what surfaced the protocol gap below.
+- **A safety suite.** Over 1,000 test cases that break one input at a time, so the integration can be
+  shipped with evidence, not hope. It is what surfaced the protocol gap below.
 
 ## Run it
 
@@ -236,9 +274,10 @@ place as over the in-process API, so the delivery finding does not depend on the
 
 ## How it is tested
 
-684 test cases, run in CI on Python 3.11 and 3.12. They break one input at a time, so a refusal always
-points at one named check. The 253 tests that build a store run twice: once with the state in memory,
-once in a SQLite file.
+1,054 test cases, run in CI on Python 3.11 and 3.12 with a Postgres service. They break one input at a
+time, so a refusal always points at one named check. Every test that builds a store runs on each
+store: in memory, a SQLite file, and Postgres. The assistant's tests use scripted models and the real
+store in process, so they need no network and no keys.
 
 - `tests/test_conformance.py`: the AP2 MUSTs around mandate chains. Wrong audience, wrong or reused
   nonce, a key nobody trusts, an expired or too-long-lived mandate, a tampered or changed checkout, an
@@ -259,6 +298,13 @@ once in a SQLite file.
 - `tests/test_stripe.py` and `tests/test_lifecycle.py`: Stripe settlement and refunds (against a fake
   Stripe, plus live tests that run only with a test key), refund limits, concurrent refunds, dispute
   evidence, the audit trail, and that an agent platform cannot move money or goods.
+- `tests/test_assistant.py`, `tests/test_assistant_api.py`, `tests/test_demo.py`: the agents and their
+  limits (a poisoned page can't redirect an order, the shopping agent never sees the address, a bad
+  proposal or a mismatched checkout is refused, a lost payment response pays once, refunds need an
+  operator, model outages and runaway agents end politely), the SSE API, approvals and their expiry,
+  webhooks into the assistant, and the public demo's sandboxes and caps.
+- `tests/test_onboarding.py`: Shopify and CSV imports, orders that keep what they were sold as, the
+  knowledge base, onboarding routes and the MCP document tool.
 - `tests/test_store.py`: a restart loses nothing; a failed change leaves nothing behind; a crash after
   Stripe charged or refunded does not charge or refund twice on retry; real OS processes racing to pay
   one session, refund one order, number sessions or send webhooks never double anything (and these
