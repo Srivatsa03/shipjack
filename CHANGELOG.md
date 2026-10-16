@@ -21,4 +21,6 @@ First version.
   scripted agent; `agent-checkout llm-bench` puts a real model in the agent's seat with paired runs
   across profiles, scored from the processor ledger and orders; `--rescore` rebuilds the tables;
   `agent-checkout demo` tells one scenario step by step.
+- Real-model results for gpt-oss-120b (45 paired trials on Groq): `docs/LLM_RESULTS.md`, with every
+  transcript in `docs/llm_results.json`.
 - Built on Google's AP2 SDK (pinned to e1ea56d, AP2 v0.2) and the ACP spec at 2026-04-17.
