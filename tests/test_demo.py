@@ -77,6 +77,21 @@ def test_each_visitor_sees_only_their_own_sandbox(demo):
     assert r.status_code == 404  # Bob's console cannot ship Alice's order
 
 
+def test_each_console_counts_only_its_own_sandbox(demo):
+    """The console's health view in the demo: one visitor's numbers, not every visitor's."""
+    client, _ = demo(buy_hub_script() + buy_hub_script())
+    alice, alice_ops = guest(client, "198.51.100.1")
+    bob, bob_ops = guest(client, "198.51.100.2")
+    buy(client, alice)
+    buy(client, bob)
+    buy_calls = None
+    for ops in (alice_ops, bob_ops):
+        m = client.get("/api/ops/metrics", headers=ops).json()
+        assert (m["threads"], m["orders"], m["purchases_approved"]) == (1, 1, 1)
+        assert m["model_calls"] > 0 and m["model_calls"] == (buy_calls or m["model_calls"])
+        buy_calls = m["model_calls"]
+
+
 def test_an_operator_cannot_decide_another_sandboxes_refund(demo):
     client, _ = demo(buy_hub_script() + [say("support"), call("request_refund", {"order_id": "ord_cs_northwind_1",
                                                                                  "reason": "broken"})])

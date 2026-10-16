@@ -60,14 +60,14 @@ class AssistantDB:
                                        "(%s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
                                        (u["id"], u["name"], u["email"], _j(u["address"]), u["token"], u["role"]))
 
-    async def _all(self, sql: str, args: tuple = ()) -> list[dict]:
+    async def _all(self, sql: str, args: tuple | dict = ()) -> list[dict]:
         async with self.pool.connection() as conn:
             cur = await conn.execute(sql, args)
             cols = [c.name for c in cur.description] if cur.description else []
             return [dict(row) if isinstance(row, dict) else dict(zip(cols, row, strict=True))
                     for row in await cur.fetchall()]
 
-    async def _one(self, sql: str, args: tuple = ()) -> dict | None:
+    async def _one(self, sql: str, args: tuple | dict = ()) -> dict | None:
         rows = await self._all(sql, args)
         return rows[0] if rows else None
 
@@ -221,21 +221,33 @@ class AssistantDB:
         return await self._all("SELECT seq, run_id, ts, event, node, data FROM events WHERE thread_id = %s AND seq > %s "
                                "ORDER BY seq LIMIT 1000", (thread_id, after))
 
-    async def metrics(self) -> dict:
-        calls = await self._one("""
+    async def metrics(self, sandbox: str | None = None) -> dict:
+        """Counts for the console's health view: the whole app, or one demo visitor's sandbox."""
+        if sandbox:
+            mine = "thread_id IN (SELECT id FROM threads WHERE user_id = %(u)s)"
+            owner = "user_id = %(u)s"
+        else:
+            mine = owner = "TRUE"
+        args = {"u": sandbox} if sandbox else ()
+        calls = await self._one(f"""
             SELECT count(*) AS model_calls,
                    coalesce(sum((data->>'tokens_in')::int), 0) AS tokens_in,
                    coalesce(sum((data->>'tokens_out')::int), 0) AS tokens_out,
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY (data->>'latency_ms')::int) AS p50_ms,
                    percentile_cont(0.95) WITHIN GROUP (ORDER BY (data->>'latency_ms')::int) AS p95_ms
-            FROM events WHERE event = 'model_call'""")
-        counts = await self._one("""
-            SELECT (SELECT count(*) FROM threads) AS threads, (SELECT count(*) FROM orders) AS orders,
-                   (SELECT count(*) FROM approvals WHERE status = 'pending') AS pending_approvals,
-                   (SELECT count(*) FROM approvals WHERE kind = 'purchase' AND status = 'approved') AS purchases_approved,
-                   (SELECT count(*) FROM approvals WHERE kind = 'purchase' AND status = 'declined') AS purchases_declined,
-                   (SELECT count(*) FROM events WHERE event IN ('checkout_refused', 'proposal_refused')) AS refused,
-                   (SELECT count(*) FROM events WHERE event IN ('model_error', 'payment_error', 'refund_error')) AS errors""")
+            FROM events WHERE event = 'model_call' AND {mine}""", args)
+        counts = await self._one(f"""
+            SELECT (SELECT count(*) FROM threads WHERE {owner}) AS threads,
+                   (SELECT count(*) FROM orders WHERE {owner}) AS orders,
+                   (SELECT count(*) FROM approvals WHERE status = 'pending' AND {mine}) AS pending_approvals,
+                   (SELECT count(*) FROM approvals WHERE kind = 'purchase' AND status = 'approved' AND {mine})
+                       AS purchases_approved,
+                   (SELECT count(*) FROM approvals WHERE kind = 'purchase' AND status = 'declined' AND {mine})
+                       AS purchases_declined,
+                   (SELECT count(*) FROM events WHERE event IN ('checkout_refused', 'proposal_refused') AND {mine})
+                       AS refused,
+                   (SELECT count(*) FROM events WHERE event IN ('model_error', 'payment_error', 'refund_error')
+                       AND {mine}) AS errors""", args)
         return {**(counts or {}), **{k: (float(v) if v is not None else None) for k, v in (calls or {}).items()}}
 
 

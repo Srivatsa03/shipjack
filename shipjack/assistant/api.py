@@ -416,8 +416,8 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
                                " ORDER BY t.updated DESC LIMIT 100", args)
 
     @app.get("/api/ops/metrics")
-    async def ops_metrics(_: dict = Depends(operator)):
-        return await db().metrics()
+    async def ops_metrics(op: dict = Depends(operator)):
+        return await db().metrics(sandbox=op.get("sandbox"))
 
     # ---- the store's signed order webhooks ----------------------------------------------------------
     @app.post("/api/webhooks/orders")

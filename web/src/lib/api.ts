@@ -1,6 +1,15 @@
 // The assistant API (shipjack/assistant/api.py).
 export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8200";
 
+// What to say when the API doesn't answer at all. A browser can't tell a sleeping, a blocked and a
+// stopped server apart, so give each setup its likely fix: a local run needs the server started, the
+// hosted demo is most likely still waking up.
+export function unreachable(): string {
+  return /^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(API)
+    ? `The assistant isn't reachable at ${API}. Start it with shipjack-assistant.`
+    : "The demo server isn't answering yet. It may still be waking up: wait a minute, then reload the page.";
+}
+
 // Who is calling. Locally, the API's fixed demo tokens. In the public demo, each browser asks for its
 // own sandbox once (a shopper and that shopper's store console) and keeps the tokens in localStorage.
 type Role = "shopper" | "operator";

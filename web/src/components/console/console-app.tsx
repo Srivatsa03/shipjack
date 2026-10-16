@@ -37,6 +37,7 @@ import {
   operator,
   type OrderRow,
   type StoredEvent,
+  unreachable,
 } from "@/lib/api";
 
 type View = "approvals" | "orders" | "catalog" | "runs" | "metrics";
@@ -58,7 +59,7 @@ export function ConsoleApp() {
       setPending(await operator.approvals("pending"));
       setError(null);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : "The assistant API isn't reachable.");
+      setError(e instanceof ApiError ? e.message : unreachable());
     }
   }, []);
 

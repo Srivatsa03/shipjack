@@ -21,6 +21,7 @@ import {
   type Thread,
   type ThreadView,
   type User,
+  unreachable,
 } from "@/lib/api";
 import { AgentTrail, type Step, stepFor } from "./agent-trail";
 import { ApprovalSheet } from "./approval-sheet";
@@ -74,9 +75,7 @@ export function ShopperApp() {
         setModels(health.models ?? []);
       } catch (err) {
         setError(
-          err instanceof ApiError
-            ? err.message
-            : `The assistant isn't reachable at ${API}. Start it with shipjack-assistant.`,
+          err instanceof ApiError ? err.message : unreachable(),
         );
       } finally {
         window.clearTimeout(slow);
