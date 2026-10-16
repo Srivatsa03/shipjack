@@ -18,15 +18,16 @@ import conftest
 
 def fake_stripe(outcome="ok"):
     """A stand-in stripe module: records PaymentIntent.create calls and returns a canned result."""
-    calls = []
+    calls, keys = [], []
 
     class Intent:
         def __init__(self, id, status):
             self.id, self.status = id, status
 
     class PaymentIntents:
-        def create(self, params):
+        def create(self, params, options=None):
             calls.append(params)
+            keys.append((options or {}).get("idempotency_key"))
             if outcome == "decline" or params.get("payment_method") == TEST_PM_DECLINE:
                 raise RuntimeError("Your card was declined. request log req_abc123")
             if outcome == "pending":
@@ -40,7 +41,7 @@ def fake_stripe(outcome="ok"):
 
     mod = types.ModuleType("stripe")
     mod.StripeClient = StripeClient
-    mod._calls = calls
+    mod._calls, mod._keys = calls, keys
     return mod
 
 
@@ -172,3 +173,16 @@ def test_live_stripe_test_mode_settles_a_card_purchase():
                                                                            "credential": {"number": "4242424242424242"}}})
     assert out["status"] == "completed"
     assert world.processor.charges[0].psp_ref.startswith("pi_")
+
+
+@pytest.mark.skipif(not __import__("os").environ.get("STRIPE_TEST_KEY"), reason="no STRIPE_TEST_KEY set")
+def test_live_stripe_returns_the_first_payment_for_a_repeated_idempotency_key():
+    """What makes a retry after a crash safe: Stripe answers the same key with the same PaymentIntent."""
+    pytest.importorskip("stripe")
+    import uuid
+    processor = StripeProcessor.from_env()
+    key = f"shipjack-test-{uuid.uuid4()}"
+    first = processor._settle(1234, "USD", "cs_idempotency_check", "card", key)
+    again = processor._settle(1234, "USD", "cs_idempotency_check", "card", key)
+    other = processor._settle(1234, "USD", "cs_idempotency_check", "card", key + "-next")
+    assert first.startswith("pi_") and again == first and other != first

@@ -4,6 +4,23 @@
 
 ### Added
 
+- **SQLite store** (`shipjack/store.py`, `shipjack-serve --db shop.db --workers N`, `build(..., db=)`):
+  sessions, orders, receipts, the audit trail, idempotency answers, the webhook outbox, id counters,
+  the checkout-signing key and the simulated processor's ledger in one WAL-mode file. Each merchant
+  change is one `BEGIN IMMEDIATE` transaction shared by every server process; each POST's idempotency
+  check, change and stored answer are one transaction. A failed change rolls back as a whole. The
+  in-memory store stays the default, and every test that builds a store runs against both.
+- **Transactional webhook outbox**: with a SQLite store, an event is written in the same transaction
+  as its order change, survives a crash, is queued per destination URL, and is sent by one process at a
+  time under a renewable lease that another process takes over when it expires.
+- **Payment-rail idempotency keys**: each charge carries a key from the session, the attempt and the
+  amount, and each refund one from the charge and what was already refunded; Stripe answers a repeated
+  key with the first result (checked against Stripe's test API). A decline moves to a new key.
+- **`shipjack load`**: drives a running store from several client processes (purchases and
+  double-pay storms), reports throughput and latency, and counts checkouts charged more than once in
+  the ledger. Results in docs/LOAD_RESULTS.md.
+- `CheckoutError` and `PaymentError` can be pickled (they cross process boundaries).
+
 - **Order webhooks** (`shipjack/webhooks.py`, `shipjack-serve --webhook-url`, `shipjack-receiver`):
   every order change goes to the agent platform as a signed ACP 2026-04-17 webhook (full Order
   snapshot; `Merchant-Signature: t=..,v1=..`, HMAC-SHA256 of `t.body`). An outbox retries network

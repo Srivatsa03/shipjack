@@ -157,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--follow-up", help="a trusting user's one reply when the model stops without paying, "
                                        "for example 'OK, go ahead.'")
     m.set_defaults(func=llm_bench)
+    from .load import add_parser as add_load
+    add_load(sub)
     args = p.parse_args(argv)
     return args.func(args)
 

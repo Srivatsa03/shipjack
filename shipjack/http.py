@@ -59,7 +59,6 @@ def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[st
     """``tokens`` maps bearer tokens to caller identities (one per agent platform); ``operators`` maps
     the merchant's own staff or back-office tokens, which alone may move money or goods after an order."""
     app = FastAPI(title=f"{merchant.info['name']} agentic checkout", version=ACP_API_VERSION)
-    stored: dict[tuple[str, str, str], tuple[str, int, Any]] = {}
     operators = dict(operators or {})
 
     async def guarded(request: Request, status: int, action, *, operator: bool = False) -> JSONResponse:
@@ -82,45 +81,48 @@ def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[st
         if version not in SUPPORTED_VERSIONS:
             return _error(400, "unsupported_api_version", f"API-Version {version} is not supported",
                           supported_versions=SUPPORTED_VERSIONS)
-        body: Any = None
-        if request.method == "POST":
-            raw = await request.body()
+        if request.method != "POST":
             try:
-                body = json.loads(raw) if raw else {}
-            except ValueError:
-                return _error(400, "invalid", "request body is not valid JSON")
-            if not isinstance(body, dict):
-                return _error(400, "invalid", "request body must be a JSON object")
-            key = request.headers.get("idempotency-key")
-            if not key:
-                return _error(400, "idempotency_key_required", "Idempotency-Key header is required on all POST requests")
-            if len(key) > 255:
-                return _error(400, "invalid", "Idempotency-Key is longer than 255 characters")
-            slot = (caller, request.url.path, key)
-            if slot in stored:
-                fingerprint, code, payload = stored[slot]
-                if fingerprint != _fingerprint(body):
-                    return _error(422, "idempotency_conflict",
-                                  "Idempotency-Key has already been used with a different request body")
-                return JSONResponse(payload, status_code=code,
-                                    headers={"Idempotent-Replayed": "true", "Idempotency-Key": key})
+                code, payload = status, action(None)
+            except Exception as exc:  # noqa: BLE001 - mapped to a flat error below
+                code, payload = _failure(request, exc)
+                if code is None:
+                    return payload
+            return _respond(request, code, payload, {})
+        raw = await request.body()
         try:
-            code, payload = status, action(body)
-        except CheckoutError as exc:
-            code, payload = (404 if exc.code == "not_found" else 400), exc.body()
-        except _NotAllowed as exc:
-            code, payload = 405, {"type": "invalid_request", "code": "invalid", "message": f"session is already {exc}"}
-        except Exception:  # a fault is a flat 500 that says nothing about the inside, and is never remembered
+            body: Any = json.loads(raw) if raw else {}
+        except ValueError:
+            return _error(400, "invalid", "request body is not valid JSON")
+        if not isinstance(body, dict):
+            return _error(400, "invalid", "request body must be a JSON object")
+        key = request.headers.get("idempotency-key")
+        if not key:
+            return _error(400, "idempotency_key_required", "Idempotency-Key header is required on all POST requests")
+        if len(key) > 255:
+            return _error(400, "invalid", "Idempotency-Key is longer than 255 characters")
+        slot = (caller, request.url.path, key)
+        try:
+            # the replay check, the action and remembering its response are one transaction, so two
+            # server processes that get the same key at the same moment cannot both act on it
+            with merchant.repo.transaction():
+                seen = merchant.repo.idempotent(slot)
+                if seen is not None:
+                    fingerprint, code, payload = seen
+                    if fingerprint != _fingerprint(body):
+                        return _error(422, "idempotency_conflict",
+                                      "Idempotency-Key has already been used with a different request body")
+                    return JSONResponse(payload, status_code=code,
+                                        headers={"Idempotent-Replayed": "true", "Idempotency-Key": key})
+                try:
+                    code, payload = status, action(body)
+                except (CheckoutError, _NotAllowed) as exc:
+                    code, payload = _failure(request, exc)
+                merchant.repo.remember(slot, _fingerprint(body), code, payload)
+        except Exception:  # a fault rolls the change back, is a flat 500, and is never remembered
             log.exception("unhandled error in %s %s", request.method, request.url.path)
             return _error(500, "internal_error", "the request could not be processed", type_="processing_error")
-        headers = {}
-        if request.method == "POST":
-            headers["Idempotency-Key"] = key
-            if code < 500:  # 5xx responses are never cached against the key
-                stored[slot] = (_fingerprint(body), code, payload)
-        if request.headers.get("request-id"):
-            headers["Request-Id"] = request.headers["request-id"]
-        return JSONResponse(payload, status_code=code, headers=headers)
+        return _respond(request, code, payload, {"Idempotency-Key": key})
 
     @app.get("/.well-known/acp.json")
     def discovery() -> dict:
@@ -225,13 +227,31 @@ class _NotAllowed(Exception):
     pass
 
 
+def _failure(request: Request, exc: Exception):
+    """An expected refusal as (status, body); anything else is logged and becomes a flat 500."""
+    if isinstance(exc, CheckoutError):
+        return (404 if exc.code == "not_found" else 400), exc.body()
+    if isinstance(exc, _NotAllowed):
+        return 405, {"type": "invalid_request", "code": "invalid", "message": f"session is already {exc}"}
+    log.exception("unhandled error in %s %s", request.method, request.url.path, exc_info=exc)
+    return None, _error(500, "internal_error", "the request could not be processed", type_="processing_error")
+
+
+def _respond(request: Request, code: int, payload: Any, headers: dict) -> JSONResponse:
+    if request.headers.get("request-id"):
+        headers["Request-Id"] = request.headers["request-id"]
+    return JSONResponse(payload, status_code=code, headers=headers)
+
+
 def demo_app(token: str = "demo-token", *, stripe: bool = False, operator_token: str = "demo-operator",
-             webhook_url: str | None = None) -> FastAPI:
+             webhook_url: str | None = None, db: str | None = None) -> FastAPI:
     """A ready-to-run store (Northwind) with one demo platform token, for ``shipjack-serve``.
 
     With ``stripe=True`` the money settles through Stripe test mode (needs STRIPE_TEST_KEY and the
     'stripe' extra); otherwise the processor is simulated. With ``webhook_url``, order events are
-    signed with SHIPJACK_WEBHOOK_SECRET and delivered to that receiver in the background.
+    signed with SHIPJACK_WEBHOOK_SECRET and delivered to that receiver in the background. With
+    ``db`` (a SQLite path) the store's state, the ledger and the webhook outbox live in that file,
+    survive a restart, and can be shared by several server processes.
     """
     from .scenarios import stores
     from .world import build
@@ -243,12 +263,21 @@ def demo_app(token: str = "demo-token", *, stripe: bool = False, operator_token:
     if webhook_url:
         from .webhooks import Outbox, secret_from_env
         outbox = Outbox(webhook_url, secret_from_env())
-    world = build(stores(), processor=processor)
+    world = build(stores(), processor=processor, db=db)
     merchant = world.merchants["northwind"]
     app = create_app(merchant, {token: "demo-agent-platform"}, operators={operator_token: "demo-operator"})
     app.state.world = world
     app.state.outbox = outbox.attach(merchant).start() if outbox else None
     return app
+
+
+def app_from_env() -> FastAPI:
+    """The demo store configured from SHIPJACK_* variables: what each worker process builds."""
+    import os
+    env = os.environ.get
+    return demo_app(env("SHIPJACK_TOKEN", "demo-token"), stripe=env("SHIPJACK_STRIPE") == "1",
+                    operator_token=env("SHIPJACK_OPERATOR_TOKEN", "demo-operator"),
+                    webhook_url=env("SHIPJACK_WEBHOOK_URL") or None, db=env("SHIPJACK_DB") or None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -260,23 +289,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--token", default="demo-token", help="the bearer token an agent platform presents")
     parser.add_argument("--stripe", action="store_true", help="settle through Stripe test mode (needs STRIPE_TEST_KEY)")
     parser.add_argument("--webhook-url", help="send signed ACP order events here (secret: SHIPJACK_WEBHOOK_SECRET)")
+    parser.add_argument("--db", help="keep the store's state in this SQLite file (survives restarts)")
+    parser.add_argument("--workers", type=int, default=1, help="server processes sharing --db (default 1)")
     args = parser.parse_args(argv)
+    if args.workers > 1 and not args.db:
+        import sys
+        print("shipjack-serve: --workers above 1 needs --db, so the processes share one store", file=sys.stderr)
+        return 2
     try:
         import uvicorn
     except ImportError:
         import sys
         print("shipjack-serve needs uvicorn: pip install 'shipjack[serve]'", file=sys.stderr)
         return 2
+    import os
+    os.environ.update({"SHIPJACK_TOKEN": args.token, "SHIPJACK_STRIPE": "1" if args.stripe else "",
+                       "SHIPJACK_WEBHOOK_URL": args.webhook_url or "", "SHIPJACK_DB": args.db or ""})
     try:
-        import os
-        app = demo_app(args.token, stripe=args.stripe, webhook_url=args.webhook_url,
-                       operator_token=os.environ.get("SHIPJACK_OPERATOR_TOKEN", "demo-operator"))
+        app = app_from_env()  # also checks the configuration before any worker starts
     except ValueError as exc:
         import sys
         print(f"shipjack-serve: {exc}", file=sys.stderr)
         return 2
     rail = "Stripe test mode" if args.stripe else "simulated processor"
     hooks = f"; order webhooks to {args.webhook_url}" if args.webhook_url else ""
-    print(f"shipjack store on http://{args.host}:{args.port}  ({rail}{hooks}; ACP discovery at /.well-known/acp.json)", flush=True)
-    uvicorn.run(app, host=args.host, port=args.port)
+    store = f"; state in {args.db}" + (f", {args.workers} workers" if args.workers > 1 else "") if args.db else ""
+    print(f"shipjack store on http://{args.host}:{args.port}  ({rail}{hooks}{store}; "
+          "ACP discovery at /.well-known/acp.json)", flush=True)
+    if args.workers > 1:
+        if app.state.outbox:
+            app.state.outbox.stop()
+        uvicorn.run("shipjack.http:app_from_env", factory=True, host=args.host, port=args.port, workers=args.workers)
+    else:
+        uvicorn.run(app, host=args.host, port=args.port)
     return 0

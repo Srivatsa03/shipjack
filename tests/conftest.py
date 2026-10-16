@@ -29,14 +29,22 @@ def stores(**changes):
     return list(out.values())
 
 
-@pytest.fixture
-def world():
-    return build(stores())
+@pytest.fixture(params=["memory", "sqlite"])
+def backend(request, tmp_path):
+    """Every test that takes a world runs twice: state in memory, and state in a SQLite file."""
+    return None if request.param == "memory" else str(tmp_path / "shipjack.db")
 
 
 @pytest.fixture
-def make_world():
-    return lambda **changes: build(stores(**changes))
+def world(backend):
+    return build(stores(), db=backend)
+
+
+@pytest.fixture
+def make_world(backend, tmp_path):
+    count = iter(range(1000))
+    return lambda **changes: build(stores(**changes),
+                                   db=None if backend is None else str(tmp_path / f"w{next(count)}.db"))
 
 
 def hub_intent(world) -> Intent:

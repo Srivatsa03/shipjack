@@ -19,6 +19,10 @@ What a real integration needs on top of the spec, and what this module adds:
   so a retried "created" can never land after "shipped".
 * **One Request-Id per event.** Every retry of an event carries the same ``Request-Id``, so the
   receiver can drop duplicates.
+* **A durable outbox, one sender.** With a SQLite store (``SqliteQueue``) an event is written in the
+  same transaction as the order change, so the two commit together or not at all and survive a
+  restart. Server processes share one queue, and a lease lets one of them send at a time, so
+  per-order ordering holds across processes too.
 * **A receiver that refuses replays.** ``Request-Id`` is outside the signature, so an attacker who
   captured a request can change it. The reference receiver therefore also remembers the signatures
   it accepted, and it never lets an older snapshot of an order (an earlier ``t``) replace a newer one.
@@ -125,6 +129,93 @@ class Delivery:
     last_error: str = ""
 
 
+class MemoryQueue:
+    """Pending events in this process: one FIFO per order."""
+
+    def __init__(self):
+        self._queues: dict[str, deque[Delivery]] = {}
+        self._lock = threading.Lock()
+
+    def push(self, d: Delivery) -> None:
+        with self._lock:
+            self._queues.setdefault(d.order_id, deque()).append(d)
+
+    def due(self, now: float, skip: set[str]) -> list[Delivery]:
+        with self._lock:
+            return [q[0] for oid, q in self._queues.items() if oid not in skip and q[0].next_at <= now]
+
+    def finish(self, d: Delivery, outcome: str) -> None:
+        if outcome == "retry":
+            return  # it stays at the head, with its new next_at
+        with self._lock:
+            queue = self._queues[d.order_id]
+            assert queue[0] is d
+            queue.popleft()
+            if not queue:
+                del self._queues[d.order_id]
+
+    def pending(self) -> list[Delivery]:
+        with self._lock:
+            return [d for q in self._queues.values() for d in q]
+
+    def acquire(self, holder: str, now: float, ttl: float) -> bool:
+        return True  # one process, one sender
+
+    def release(self, holder: str) -> None:
+        pass
+
+
+class SqliteQueue:
+    """Pending events in the store's SQLite file, written in the same transaction as the order change.
+
+    ``name`` is the destination (one queue per receiver URL). Every server process can queue; a lease
+    (``leases`` table) lets one of them send at a time.
+    """
+
+    def __init__(self, db, name: str):
+        self.db, self.name, self.lease = db, name, f"webhooks:{name}"
+
+    def push(self, d: Delivery) -> None:
+        self.db.write("INSERT INTO outbox (id, queue, order_id, type, body, created, next_at) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?)", (d.id, self.name, d.order_id, d.type, d.body, d.created, d.next_at))
+
+    _COLUMNS = "id, order_id, type, body, created, attempts, next_at, state, last_status, last_error"
+
+    def _rows(self, where: str, args: tuple) -> list[Delivery]:
+        rows = self.db.read(f"SELECT {self._COLUMNS} FROM outbox o WHERE queue = ? AND {where} ORDER BY seq",
+                            (self.name, *args))
+        return [Delivery(r[0], r[1], r[2], bytes(r[3]), r[4], r[5], r[6], r[7], r[8], r[9]) for r in rows]
+
+    def due(self, now: float, skip: set[str]) -> list[Delivery]:
+        heads = self._rows("state = 'pending' AND next_at <= ? AND seq = (SELECT MIN(seq) FROM outbox p "
+                           "WHERE p.queue = o.queue AND p.order_id = o.order_id AND p.state = 'pending')", (now,))
+        return [d for d in heads if d.order_id not in skip]
+
+    def finish(self, d: Delivery, outcome: str) -> None:
+        self.db.write("UPDATE outbox SET state = ?, attempts = ?, next_at = ?, last_status = ?, last_error = ? "
+                      "WHERE id = ?", (d.state, d.attempts, d.next_at, d.last_status, d.last_error, d.id))
+
+    def pending(self) -> list[Delivery]:
+        return self._rows("state = 'pending'", ())
+
+    def settled(self, state: str) -> list[Delivery]:
+        return self._rows("state = ?", (state,))
+
+    def acquire(self, holder: str, now: float, ttl: float) -> bool:
+        """Take or renew the sender lease. It is free when nobody holds it or the holder let it expire."""
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT holder, expires FROM leases WHERE name = ?", (self.lease,)).fetchone()
+            if row is not None and row[0] != holder and row[1] >= now:
+                return False
+            conn.execute("INSERT OR REPLACE INTO leases (name, holder, expires) VALUES (?, ?, ?)",
+                         (self.lease, holder, now + ttl))
+            return True
+
+    def release(self, holder: str) -> None:
+        """Give the lease up now (a clean shutdown), so another process need not wait for it to expire."""
+        self.db.write("DELETE FROM leases WHERE name = ? AND holder = ?", (self.lease, holder))
+
+
 @dataclass
 class Outbox:
     """Signed, ordered, retried delivery of order events to one agent platform's receiver."""
@@ -138,11 +229,12 @@ class Outbox:
     jitter: bool = True
     timeout: float = 10.0
     clock: Callable[[], float] = time.time
-    delivered: list[Delivery] = field(default_factory=list)
-    dead: list[Delivery] = field(default_factory=list)
+    queue: MemoryQueue | SqliteQueue | None = None
+    lease_ttl: float = 30.0
+    delivered: list[Delivery] = field(default_factory=list)  # what this process delivered
+    dead: list[Delivery] = field(default_factory=list)       # what this process gave up on
     attempts_log: list[dict] = field(default_factory=list)
-    _queues: dict[str, deque[Delivery]] = field(default_factory=dict, repr=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _holder: str = field(default_factory=lambda: f"{os.getpid()}-{secrets.token_hex(6)}", repr=False)
     _run_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _thread: threading.Thread | None = field(default=None, repr=False)
@@ -154,52 +246,53 @@ class Outbox:
 
     # ---- the merchant side -------------------------------------------------------------------
     def attach(self, merchant) -> Outbox:
+        """Listen to a merchant. Unless a queue was given, the events are kept where the merchant keeps
+        its state (in SQLite, in the same transaction as the order change)."""
+        if self.queue is None:
+            self.queue = merchant.repo.outbox_queue(self.url)
         merchant.listeners.append(self)
         return self
 
+    def detach(self, merchant) -> None:
+        merchant.listeners.remove(self)
+
     def __call__(self, event_type: str, order: dict) -> None:
-        """A Merchant listener: queue the event. Quick, because the merchant's lock is held."""
+        """A Merchant listener: queue the event, inside the merchant's transaction."""
         self.enqueue(event_type, order)
 
     def enqueue(self, event_type: str, order: dict) -> Delivery:
         body = json.dumps({"type": event_type, "data": order}, separators=(",", ":")).encode()
         now = self.clock()
         delivery = Delivery("evt_" + secrets.token_hex(12), order["id"], event_type, body, now, next_at=now)
-        with self._lock:
-            self._queues.setdefault(delivery.order_id, deque()).append(delivery)
+        if self.queue is None:
+            self.queue = MemoryQueue()
+        self.queue.push(delivery)
         return delivery
 
     def pending(self) -> int:
-        with self._lock:
-            return sum(len(q) for q in self._queues.values())
+        return len(self.queue.pending()) if self.queue is not None else 0
 
     # ---- delivery ------------------------------------------------------------------------------
     def run_once(self) -> int:
-        """Try each order's oldest event that is due. Returns how many events were delivered.
-
-        Network calls happen without the queue lock, so new events can be queued meanwhile.
-        """
-        delivered = 0
+        """Send each order's oldest event that is due, then the next, until nothing is due. Returns how
+        many events were delivered. No lock or transaction is held during a network call."""
+        delivered, held = 0, set()  # held: orders whose head is waiting to retry
+        if self.queue is None:
+            return 0
         with self._run_lock:
-            with self._lock:
-                order_ids = list(self._queues)
-            for order_id in order_ids:
-                while True:
-                    with self._lock:
-                        queue = self._queues.get(order_id)
-                        head = queue[0] if queue else None
-                    if head is None or head.next_at > self.clock():
-                        break
+            while self.queue.acquire(self._holder, self.clock(), self.lease_ttl):
+                heads = self.queue.due(self.clock(), held)
+                if not heads:
+                    break
+                for head in heads:
+                    if not self.queue.acquire(self._holder, self.clock(), self.lease_ttl):
+                        return delivered  # another process took over the sending
                     outcome = self._attempt(head)
-                    with self._lock:
-                        if outcome != "retry":
-                            queue.popleft()
-                            if not queue:
-                                del self._queues[order_id]
+                    self.queue.finish(head, outcome)
                     if outcome == "delivered":
                         delivered += 1
                     elif outcome == "retry":
-                        break  # later events for this order wait behind this one
+                        held.add(head.order_id)  # later events for this order wait behind this one
         return delivered
 
     def _attempt(self, d: Delivery) -> str:
@@ -257,6 +350,8 @@ class Outbox:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
+        if self.queue is not None:
+            self.queue.release(self._holder)
 
 
 # ---- the agent platform side: a reference receiver -------------------------------------------------

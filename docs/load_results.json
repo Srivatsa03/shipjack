@@ -1,0 +1,124 @@
+{
+ "machine": "Apple M1, 8 cores, 8 GB; server and load generator on the same machine",
+ "server": "shipjack-serve --db shop.db --workers N (uvicorn, SQLite WAL, simulated processor)",
+ "command": "shipjack load --purchases 10000 --concurrency 16 --clients 4 --storms 200 --storm-size 20 --db shop.db",
+ "date": "2026-10-16",
+ "runs": [
+  {
+   "clients": 4,
+   "concurrency_per_client": 16,
+   "purchases": {
+    "attempted": 10000,
+    "completed": 10000,
+    "errors": 0,
+    "error_kinds": [],
+    "wall_s": 24.87,
+    "per_second": 402.1,
+    "p50_ms": 127.8,
+    "p95_ms": 325.3,
+    "p99_ms": 458.8
+   },
+   "storms": {
+    "storms": 200,
+    "agents_per_storm": 20,
+    "storms_with_one_paid_answer": 200,
+    "most_paid_answers_in_a_storm": 1,
+    "server_errors": 0
+   },
+   "ledger": {
+    "charges": 10200,
+    "orders": 10200,
+    "checkouts_charged_more_than_once": 0,
+    "storm_sessions_charged_exactly_once": 200
+   },
+   "server_workers": 1
+  },
+  {
+   "clients": 4,
+   "concurrency_per_client": 16,
+   "purchases": {
+    "attempted": 10000,
+    "completed": 10000,
+    "errors": 0,
+    "error_kinds": [],
+    "wall_s": 22.3,
+    "per_second": 448.4,
+    "p50_ms": 112.9,
+    "p95_ms": 319.2,
+    "p99_ms": 475.7
+   },
+   "storms": {
+    "storms": 200,
+    "agents_per_storm": 20,
+    "storms_with_one_paid_answer": 200,
+    "most_paid_answers_in_a_storm": 1,
+    "server_errors": 0
+   },
+   "ledger": {
+    "charges": 10200,
+    "orders": 10200,
+    "checkouts_charged_more_than_once": 0,
+    "storm_sessions_charged_exactly_once": 200
+   },
+   "server_workers": 2
+  },
+  {
+   "clients": 4,
+   "concurrency_per_client": 16,
+   "purchases": {
+    "attempted": 10000,
+    "completed": 10000,
+    "errors": 0,
+    "error_kinds": [],
+    "wall_s": 17.16,
+    "per_second": 582.7,
+    "p50_ms": 74.7,
+    "p95_ms": 296.1,
+    "p99_ms": 507.1
+   },
+   "storms": {
+    "storms": 200,
+    "agents_per_storm": 20,
+    "storms_with_one_paid_answer": 200,
+    "most_paid_answers_in_a_storm": 1,
+    "server_errors": 0
+   },
+   "ledger": {
+    "charges": 10200,
+    "orders": 10200,
+    "checkouts_charged_more_than_once": 0,
+    "storm_sessions_charged_exactly_once": 200
+   },
+   "server_workers": 4
+  },
+  {
+   "clients": 4,
+   "concurrency_per_client": 16,
+   "purchases": {
+    "attempted": 10000,
+    "completed": 10000,
+    "errors": 0,
+    "error_kinds": [],
+    "wall_s": 15.52,
+    "per_second": 644.5,
+    "p50_ms": 60.9,
+    "p95_ms": 266.3,
+    "p99_ms": 439.3
+   },
+   "storms": {
+    "storms": 200,
+    "agents_per_storm": 20,
+    "storms_with_one_paid_answer": 200,
+    "most_paid_answers_in_a_storm": 1,
+    "server_errors": 0
+   },
+   "ledger": {
+    "charges": 10200,
+    "orders": 10200,
+    "checkouts_charged_more_than_once": 0,
+    "storm_sessions_charged_exactly_once": 200
+   },
+   "server_workers": 6
+  }
+ ]
+}

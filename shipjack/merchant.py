@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import functools
 import secrets
-import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -26,6 +25,7 @@ from .catalog import Fulfillment, Product
 from .keys import new_key, public
 from .mandates import FULFILLMENT, TrustList, digest, error_code, verify_checkout
 from .psp import PaymentError, Processor
+from .store import MemoryRepo
 
 ACP_API_VERSION = "2026-04-17"
 MAX_QUANTITY = 1000  # per line; a store caps what one order can ask for
@@ -37,10 +37,23 @@ def _now() -> str:
 
 
 def _locked(method):
-    """Run a public Merchant method with the merchant's lock held: one request changes a session at a time."""
+    """Run a public Merchant method as one transaction: one request changes a session at a time.
+
+    In memory that is the merchant's lock; in SQLite it is a write transaction that every server
+    process shares, and an error rolls the whole change back.
+    """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
-        with self._lock:
+        with self.repo.transaction():
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+def _reading(method):
+    """Run a read-only Merchant method on one consistent snapshot."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.repo.transaction(write=False):
             return method(self, *args, **kwargs)
     return wrapper
 
@@ -49,6 +62,9 @@ class CheckoutError(Exception):
     def __init__(self, code: str, message: str, param: str | None = None):
         super().__init__(message)
         self.code, self.param = code, param
+
+    def __reduce__(self):  # picklable, so a refusal can cross a process boundary
+        return (self.__class__, (self.code, str(self), self.param))
 
     def body(self) -> dict:
         out = {"type": "invalid_request", "code": self.code, "message": str(self)}
@@ -68,31 +84,46 @@ class Session:
     nonce: str | None = None
     order: dict | None = None
     messages: list[dict] = field(default_factory=list)
+    attempts: int = 0  # failed payment attempts; part of the payment rail's idempotency key
 
 
 class Merchant:
     def __init__(self, id: str, name: str, website: str, products: list[Product], processor: Processor,
                  trust: TrustList, *, supported: frozenset[str] = frozenset({FULFILLMENT}),
-                 verifies_mandates: bool = True, impostor_of: dict | None = None, surcharge: int = 0):
+                 verifies_mandates: bool = True, impostor_of: dict | None = None, surcharge: int = 0,
+                 repo=None):
         self.info = {"id": id, "name": name, "website": website}
         self.claimed = dict(impostor_of) if impostor_of else dict(self.info)
-        self.key: JWK = new_key(f"{id}-checkout-1")
+        self.repo = repo if repo is not None else MemoryRepo()
+        # every server process and every restart must sign checkouts with the same key
+        self.key: JWK = self.repo.signing_key(f"{id}-checkout-1", lambda: new_key(f"{id}-checkout-1"))
         self.products = {p.id: p for p in products}
         self.processor, self.trust, self.supported = processor, trust, supported
         self.verifies_mandates, self.surcharge = verifies_mandates, surcharge
         self.account = f"acct_{id}"
         processor.registered[self.account] = id
-        self.sessions: dict[str, Session] = {}
-        self.orders: list[dict] = []
-        self.receipts: list[dict] = []
-        self.audit: list[dict] = []           # append-only log of what happened, for reconciliation and disputes
-        self._records: dict[str, dict] = {}   # order id -> {charge, checkout_jwt, receipt, mandate_reference}
-        self.listeners: list = []              # called as listener(event_type, acp_order) after each order change
-        self._count = 0
-        self._lock = threading.RLock()
+        self.listeners: list = []  # called as listener(event_type, acp_order) after each order change
+
+    # the state lives in the repository; these are read views of it
+    @property
+    def sessions(self):
+        return self.repo.sessions
+
+    @property
+    def orders(self):
+        return self.repo.orders
+
+    @property
+    def receipts(self):
+        return self.repo.receipts
+
+    @property
+    def audit(self):
+        """Append-only log of what happened, for reconciliation and disputes."""
+        return self.repo.audit
 
     def _log(self, event: str, **fields) -> None:
-        self.audit.append({"ts": int(time.time()), "merchant": self.id, "event": event, **fields})
+        self.repo.log({"ts": int(time.time()), "merchant": self.id, "event": event, **fields})
 
     def _emit(self, event: str, order_id: str) -> None:
         """Tell listeners (e.g. the webhook outbox) about an order change, with the lock still held.
@@ -130,9 +161,8 @@ class Merchant:
                        buyer: dict | None = None) -> dict:
         details, buyer = self._details(fulfillment_details), self._buyer(buyer)
         cart = self._items(items)
-        self._count += 1
-        session = Session(f"cs_{self.id}_{self._count}", cart, details, buyer)
-        self.sessions[session.id] = session
+        session = Session(f"cs_{self.id}_{self.repo.next_number()}", cart, details, buyer)
+        self.repo.add_session(session)
         self._log("session_created", session=session.id, items=[list(i) for i in cart])
         return self._render(self._refresh(session))
 
@@ -152,6 +182,7 @@ class Merchant:
             session.buyer = buyer
         return self._render(self._refresh(session))
 
+    @_reading
     def get_session(self, session_id: str) -> dict:
         return self._render(self._session(session_id))
 
@@ -172,21 +203,24 @@ class Merchant:
             raise CheckoutError("invalid", "payment_data must be an object", "$.payment_data")
         handler = payment_data.get("handler_id")
         amount = self._total(session) + self.surcharge
+        # the same attempt at the same amount gets the same key, so a retry after a crash cannot pay twice
+        key = f"shipjack:{self.id}:{session.id}:{session.attempts}:{amount}"
         try:
             if handler == "card":
                 instrument = payment_data.get("instrument")
                 credential = instrument.get("credential") if isinstance(instrument, dict) else None
                 number = credential.get("number") if isinstance(credential, dict) else None
                 charge = self.processor.charge_card(self.account, number if isinstance(number, str) else "", amount,
-                                                    "USD", session.id)
+                                                    "USD", session.id, idempotency_key=key)
                 receipt = None
             elif handler == "ap2":
-                charge, receipt = self._complete_ap2(session, payment_data, amount)
+                charge, receipt = self._complete_ap2(session, payment_data, amount, key)
             elif handler == "direct":
-                charge, receipt = self._complete_direct(session, payment_data, amount)
+                charge, receipt = self._complete_direct(session, payment_data, amount, key)
             else:
                 raise CheckoutError("invalid", "unsupported payment handler", "$.payment_data.handler_id")
         except PaymentError as exc:
+            session.attempts += 1
             session.messages = [{"type": "error", "code": "payment_declined", "content_type": "plain",
                                  "content": str(exc)}]
             out = self._render(session)
@@ -198,10 +232,9 @@ class Merchant:
                  "payment_status": "paid", "refunded": 0, "status": "created", "created_at": _now(),
                  "items": list(session.items), "fulfillment_details": session.fulfillment.to_acp(),
                  "fulfillments": [], "adjustments": []}
-        self.orders.append(order)
-        self._records[order["id"]] = {"charge": charge, "checkout_jwt": session.checkout_jwt if handler != "card"
-                                      else None, "receipt": receipt,
-                                      "mandate_reference": (receipt or {}).get("claims", {}).get("reference", "")}
+        self.repo.add_order(order, {"charge": charge, "checkout_jwt": session.checkout_jwt if handler != "card"
+                                    else None, "receipt": receipt,
+                                    "mandate_reference": (receipt or {}).get("claims", {}).get("reference", "")})
         self._log("order_paid", order=order["id"], amount=charge.amount, method=charge.method, psp_ref=charge.psp_ref)
         session.order, session.status, session.messages = order, "completed", []
         self._emit("order_create", order["id"])
@@ -296,7 +329,7 @@ class Merchant:
         self._emit("order_update", order_id)
         return self.acp_order(order_id)
 
-    @_locked
+    @_reading
     def acp_order(self, order_id: str) -> dict:
         """The order as ACP 2026-04-17 describes it (the full Order object a webhook carries)."""
         _, order = self._order(order_id)
@@ -327,11 +360,12 @@ class Merchant:
                 "adjustments": [dict(a) for a in order["adjustments"]], "totals": totals}
 
     def _order(self, order_id: str) -> tuple[dict, dict]:
-        record = self._records.get(order_id)
+        record = self.repo.record(order_id) if isinstance(order_id, str) else None
         if record is None:
             raise CheckoutError("not_found", f"no order {order_id!r}")
-        return record, next(o for o in self.orders if o["id"] == order_id)
+        return record, self.repo.order(order_id)
 
+    @_reading
     def dispute_evidence(self, order_id: str) -> dict:
         """The non-repudiable picture AP2 describes: the signed checkout, the mandate, the receipt, the money.
 
@@ -362,7 +396,7 @@ class Merchant:
         self._log("checkout_signed", session=session.id, checkout_hash=digest(session.checkout_jwt))
         return {"checkout_jwt": session.checkout_jwt, "nonce": session.nonce, "aud": self.id}
 
-    def _complete_ap2(self, session: Session, payment_data: dict, amount: int):
+    def _complete_ap2(self, session: Session, payment_data: dict, amount: int, key: str):
         if not session.checkout_jwt or not session.nonce:
             raise PaymentError("invalid_mandate", "no signed checkout to approve: call ap2_checkout first")
         text = lambda v: v if isinstance(v, str) else ""  # noqa: E731  (wrong types are treated as missing)
@@ -376,10 +410,11 @@ class Merchant:
                 raise PaymentError(error_code(violations), "; ".join(violations))
         charge = self.processor.charge_token(self.account, text(payment_data.get("payment_token")), amount, "USD",
                                              digest(session.checkout_jwt),
-                                             text(payment_data.get("open_checkout_hash")) or None)
+                                             text(payment_data.get("open_checkout_hash")) or None,
+                                             idempotency_key=key)
         return charge, self._receipt(mandate, "Success", order_id=f"ord_{session.id}")
 
-    def _complete_direct(self, session: Session, payment_data: dict, amount: int):
+    def _complete_direct(self, session: Session, payment_data: dict, amount: int, key: str):
         """Human-present: the user signed this exact checkout on their trusted surface."""
         from .direct import verify_user_approval
         if not session.checkout_jwt or not session.nonce:
@@ -394,7 +429,7 @@ class Merchant:
             raise PaymentError(error_code(violations), "; ".join(violations))
         token = self.processor.credentials.authorize_direct(claims)
         charge = self.processor.charge_token(self.account, token, amount, "USD", digest(session.checkout_jwt),
-                                             method="direct")
+                                             method="direct", idempotency_key=key)
         return charge, self._receipt(approval, "Success", order_id=f"ord_{session.id}")
 
     def _receipt(self, mandate: str, status: str, **extra) -> dict:
@@ -406,7 +441,7 @@ class Merchant:
         claims.update({k: v for k, v in extra.items() if v})
         receipt = {"jwt": create_jwt({"alg": "ES256", "typ": "JWT", "kid": self.key.get("kid")}, claims, self.key),
                    "claims": claims}
-        self.receipts.append(receipt)
+        self.repo.add_receipt(receipt)
         return receipt
 
     # ---- internals -------------------------------------------------------------------------------
@@ -447,9 +482,10 @@ class Merchant:
         return data
 
     def _session(self, session_id: str) -> Session:
-        if session_id not in self.sessions:
+        session = self.repo.session(session_id) if isinstance(session_id, str) else None
+        if session is None:
             raise CheckoutError("not_found", f"no checkout session {session_id!r}")
-        return self.sessions[session_id]
+        return session
 
     def _open(self, session_id: str) -> Session:
         session = self._session(session_id)

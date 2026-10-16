@@ -19,8 +19,13 @@ doc is written as the guide an FDE would hand a merchant, and it marks what is r
 ## 3. Run the store
 
 ```bash
-shipjack-serve --host 0.0.0.0 --port 8000
+shipjack-serve --host 0.0.0.0 --port 8000                         # state in memory: a demo
+shipjack-serve --host 0.0.0.0 --port 8000 --db shop.db --workers 4  # state in SQLite, 4 processes
 ```
+
+With `--db`, sessions, orders, refunds, receipts, the audit trail, idempotency answers, the webhook
+outbox and the checkout-signing key live in that file: a restart loses nothing, and every process
+signs with the same key. See section 9.
 
 Check discovery (no auth needed):
 
@@ -138,17 +143,45 @@ accepted; a retry carries the same `Request-Id`; and an older snapshot of an ord
 replaces a newer one, so a captured "created" replayed after "shipped" cannot roll the order back.
 Unknown event types and statuses are accepted, as the spec requires.
 
-Today the outbox lives in memory: events queued when the process stops are lost. A merchant running
-this for real puts the outbox in the same database transaction as the order change.
+Without `--db` the outbox lives in memory, and events still queued when the process stops are lost.
+With `--db` it is a table in the same file, written in the same transaction as the order change: an
+order and its event commit together or not at all, and pending events survive a crash. Several server
+processes share the queue, and a lease (30 s, renewed before each send) lets one of them send at a
+time, so ordering holds across processes; if that process dies, another takes over when the lease
+runs out.
 
-## 9. The delivery constraint (recommended default on)
+## 9. Durable state and several processes
+
+`shipjack-serve --db shop.db --workers N` runs N processes on one SQLite file (WAL mode). Every change
+is one write transaction (`BEGIN IMMEDIATE`) that all processes share, so "is this session still
+payable?" and "record the charge" happen as one step even when processes race. For a POST, the
+idempotency check, the change and the stored answer are one transaction too, so two processes that
+get the same `Idempotency-Key` at the same moment cannot both act on it.
+
+| Failure | What happens |
+|---|---|
+| Two processes pay one session | One charge; the other gets "session is already completed". |
+| An error in the middle of a change | The whole change rolls back: no order without its charge, no charge without its order, no order without its webhook event. |
+| The process dies after Stripe charged, before the order was recorded | The order rolls back; the client's retry sends the same Stripe idempotency key and gets the first PaymentIntent back, not a second charge. |
+| `kill -9`, then restart | Sessions, orders, idempotency answers and pending webhooks are all still there; ids continue. |
+
+Check a running store under load (it reads the ledger afterwards and counts double charges):
+
+```bash
+shipjack load --url http://127.0.0.1:8000 --purchases 10000 --clients 4 --storms 200 --db shop.db
+```
+
+Results on one laptop are in [LOAD_RESULTS.md](LOAD_RESULTS.md). SQLite fits one host; several hosts
+need a server database with the same transactions and idempotency keys.
+
+## 10. The delivery constraint (recommended default on)
 
 AP2 v0.2 does not constrain where goods are delivered. shipjack adds a checkout constraint,
 `io.github.srivatsa03.fulfillment`, that pins the allowed ship-to address and delivery email. The
 wallet checks it before signing and the merchant checks it again. Keep it on; see
 [AP2 issue #381](https://github.com/google-agentic-commerce/AP2/issues/381) and the README.
 
-## 10. Ship gate: the safety suite
+## 11. Ship gate: the safety suite
 
 Run `python -m pytest -q` before any change goes out. The suite is the deployment gate: AP2 MUSTs,
 the ACP API on bad input, address and email matching, concurrency, and seeded fuzzing. `shipjack
@@ -157,7 +190,8 @@ bench` prints what each payment profile stops.
 ## What is real and what is simulated
 
 - **Real:** the ACP REST contract and MCP binding, the AP2 SDK cryptography, the Stripe test-mode
-  settlement, signed order webhooks over HTTP, the idempotency and concurrency handling.
+  settlement and its idempotency keys, signed order webhooks over HTTP, the SQLite store shared by
+  several processes, the idempotency and concurrency handling.
 - **Simulated:** the product catalog, the merchant's onboarding, the carrier (an operator marks an
   order shipped and delivered), and (without a Stripe key) the money. Swapping the catalog and the processor for a merchant's real systems is the
   remaining integration work.

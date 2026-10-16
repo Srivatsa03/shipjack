@@ -152,6 +152,8 @@ def lifecycle_events(world, steps):
     for step, args in steps.get("then", []):
         getattr(m, step)(oid, **args)
     box.run_once()
+    box.detach(m)
+    box.stop()
     return m, oid, box.send.events()
 
 
@@ -251,7 +253,7 @@ def test_a_transient_failure_is_retried_with_backoff_and_the_same_request_id(wor
     for _ in range(4):
         box.run_once()
         if box.pending():
-            waits.append(box._queues[next(iter(box._queues))][0].next_at - clock.t)
+            waits.append(box.queue.pending()[0].next_at - clock.t)
             clock.t += 1000
     assert waits == [1.0, 2.0, 4.0] and box.pending() == 0 and len(box.delivered) == 1
     assert len({c["headers"]["Request-Id"] for c in platform.calls}) == 1
@@ -280,7 +282,7 @@ def test_backoff_is_capped(world):
     waits = []
     for _ in range(8):
         box.run_once()
-        waits.append(box._queues[next(iter(box._queues))][0].next_at - clock.t)
+        waits.append(box.queue.pending()[0].next_at - clock.t)
         clock.t += 1000
     assert waits == [1, 2, 4, 8, 16, 30, 30, 30]
 

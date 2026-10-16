@@ -23,6 +23,9 @@ class PaymentError(Exception):
         super().__init__(message)
         self.code = code
 
+    def __reduce__(self):  # picklable, so a refusal can cross a process boundary
+        return (self.__class__, (self.code, str(self)))
+
 
 @dataclass
 class Charge:
@@ -33,6 +36,7 @@ class Charge:
     reference: str  # checkout session id, or the AP2 transaction_id (the checkout hash)
     psp_ref: str = ""  # the payment-rail id (e.g. a Stripe PaymentIntent), when a real PSP settled it
     refunded: int = 0  # how much of this charge has been refunded
+    id: str = field(default_factory=lambda: "ch_" + secrets.token_hex(8))
 
 
 @dataclass
@@ -41,6 +45,7 @@ class Refund:
     amount: int
     currency: str
     psp_ref: str = ""  # the payment-rail refund id, when a real PSP refunded it
+    charge_id: str = ""
 
 
 @dataclass
@@ -81,40 +86,46 @@ class Processor:
             if charge.refunded + amount > charge.amount:
                 raise PaymentError("invalid_refund",
                                    f"refund {amount} over the {charge.amount - charge.refunded} still refundable")
-            psp_ref = self._refund_rail(charge.psp_ref, amount, charge.currency)
+            # what was refunded before this one identifies the step, so a retry after a crash refunds once
+            key = f"shipjack-refund:{charge.id}:{charge.refunded}:{amount}"
+            psp_ref = self._refund_rail(charge.psp_ref, amount, charge.currency, key)
             charge.refunded += amount
-            refund = Refund(charge.reference, amount, charge.currency, psp_ref)
+            refund = Refund(charge.reference, amount, charge.currency, psp_ref, charge.id)
             self.refunds.append(refund)
             return refund
 
-    def _refund_rail(self, psp_ref: str, amount: int, currency: str) -> str:
+    def _refund_rail(self, psp_ref: str, amount: int, currency: str, idempotency_key: str = "") -> str:
         """Return money on the payment rail. The base processor is simulated; a real PSP overrides this."""
         return ""
 
-    def charge_card(self, account: str, card_number: str, amount: int, currency: str, reference: str) -> Charge:
+    def charge_card(self, account: str, card_number: str, amount: int, currency: str, reference: str,
+                    idempotency_key: str = "") -> Charge:
         """A raw card number authorizes any amount for anyone who holds it. That is the baseline."""
         with self._lock:
-            return self._charge_card(account, card_number, amount, currency, reference)
+            return self._charge_card(account, card_number, amount, currency, reference, idempotency_key)
 
-    def _charge_card(self, account: str, card_number: str, amount: int, currency: str, reference: str) -> Charge:
+    def _charge_card(self, account: str, card_number: str, amount: int, currency: str, reference: str,
+                     idempotency_key: str = "") -> Charge:
         if not self.credentials or card_number != self.credentials.card.number:
             raise PaymentError("payment_declined", "card number not recognised")
-        psp_ref = self._settle(amount, currency, reference, "card")
+        psp_ref = self._settle(amount, currency, reference, "card", idempotency_key)
         charge = Charge(account, amount, currency, "card", reference, psp_ref)
         self.charges.append(charge)
         return charge
 
     def charge_token(self, account: str, token: str, amount: int, currency: str, transaction_id: str,
-                     open_checkout_hash: str | None = None, method: str = "ap2") -> Charge:
+                     open_checkout_hash: str | None = None, method: str = "ap2", idempotency_key: str = "") -> Charge:
         """An AP2 token pays one checkout, for its approved amount, to its approved payee, once.
 
         ``method`` labels the charge: "ap2" for a mandate chain, "direct" for a user-signed approval.
         """
         with self._lock:
-            return self._charge_token(account, token, amount, currency, transaction_id, open_checkout_hash, method)
+            return self._charge_token(account, token, amount, currency, transaction_id, open_checkout_hash, method,
+                                      idempotency_key)
 
     def _charge_token(self, account: str, token: str, amount: int, currency: str, transaction_id: str,
-                      open_checkout_hash: str | None = None, method: str = "ap2") -> Charge:
+                      open_checkout_hash: str | None = None, method: str = "ap2",
+                      idempotency_key: str = "") -> Charge:
         scope = self.credentials.redeem(token) if self.credentials else None
         if scope is None:
             raise PaymentError("payment_declined", "unknown or already used payment token")
@@ -129,18 +140,19 @@ class Processor:
             raise PaymentError("payment_declined", "token is bound to a different open checkout mandate")
         if self.binds_payee and self.registered.get(account) != scope.payee_id:
             raise PaymentError("payment_declined", f"token pays {scope.payee_id}, not account {account}")
-        psp_ref = self._settle(amount, currency, transaction_id, method)
+        psp_ref = self._settle(amount, currency, transaction_id, method, idempotency_key)
         scope.used = True  # settle first; a PSP decline must not spend the token
         charge = Charge(account, amount, currency, method, transaction_id, psp_ref)
         self.charges.append(charge)
         return charge
 
-    def _settle(self, amount: int, currency: str, reference: str, method: str) -> str:
+    def _settle(self, amount: int, currency: str, reference: str, method: str, idempotency_key: str = "") -> str:
         """Move the money on the payment rail. The base processor is simulated and settles instantly.
 
         A real PSP (see shipjack/stripe_psp.py) overrides this to charge, and raises PaymentError on a
         decline. It runs after every authorization check and before the charge is recorded, so a
-        decline leaves no charge and does not spend the token.
+        decline leaves no charge and does not spend the token. ``idempotency_key`` is the same for a
+        retry of the same payment attempt, so a rail that honours it charges once.
         """
         return ""
 

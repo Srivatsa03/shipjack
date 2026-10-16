@@ -222,23 +222,39 @@ def test_order_endpoints_need_auth_and_know_unknown_orders(world, api):
 
 
 def fake_stripe(refund_fails=False):
-    calls = {"intents": [], "refunds": []}
+    """A fake Stripe that, like Stripe, answers a repeated idempotency key with the first result."""
+    calls = {"intents": [], "refunds": [], "keys": []}
+    seen = {}
 
     class Obj:
         def __init__(self, **kw):
             self.__dict__.update(kw)
 
+    def once(options, make):
+        key = (options or {}).get("idempotency_key")
+        calls["keys"].append(key)
+        if key and key in seen:
+            return seen[key]
+        result = make()
+        if key:
+            seen[key] = result
+        return result
+
     class Intents:
-        def create(self, params):
-            calls["intents"].append(params)
-            return Obj(id="pi_fake_1", status="succeeded")
+        def create(self, params, options=None):
+            def make():
+                calls["intents"].append(params)
+                return Obj(id=f"pi_fake_{len(calls['intents'])}", status="succeeded")
+            return once(options, make)
 
     class Refunds:
-        def create(self, params):
-            calls["refunds"].append(params)
-            if refund_fails:
-                raise RuntimeError("charge already refunded req_zzz")
-            return Obj(id=f"re_fake_{len(calls['refunds'])}")
+        def create(self, params, options=None):
+            def make():
+                calls["refunds"].append(params)
+                if refund_fails:
+                    raise RuntimeError("charge already refunded req_zzz")
+                return Obj(id=f"re_fake_{len(calls['refunds'])}")
+            return once(options, make)
 
     class V1:
         payment_intents, refunds = Intents(), Refunds()

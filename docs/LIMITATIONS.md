@@ -2,8 +2,9 @@
 
 ## Of the setup
 
-- **Everything is simulated.** The stores, the credential provider, the processor and the money are
-  in-process Python objects. No card network, no Stripe, no real merchant. The protocol code is real
+- **The bench is simulated.** In the safety bench, the stores, the credential provider, the processor
+  and the money are in-process Python objects. No card network, no real merchant. (The deployment layer
+  can settle on Stripe in test mode; the bench does not.) The protocol code is real
   (Google's AP2 SDK does the SD-JWT and constraint work), but the results describe this deployment,
   not any production system.
 - **Best case for AP2, on purpose.** The user's open mandates are built from each scenario's intent
@@ -39,10 +40,17 @@
 
 ## Of the hardening
 
-- **Locks are in-process.** The merchant, processor and credential provider serialise their
-  check-then-act steps with `threading` locks. A deployment with several processes needs the same
-  guarantee from its database (a unique constraint on the idempotency key and a single-use update on
-  the token).
+- **Without `--db`, locks are in-process.** The merchant, processor and credential provider serialise
+  their check-then-act steps with `threading` locks. With `--db`, the merchant's changes are SQLite
+  write transactions shared by every server process (tested with racing OS processes). SQLite fits one
+  host; several hosts need a server database with the same guarantees.
+- **The credential provider is in-process.** AP2 payment tokens are minted and spent in one process.
+  The SQLite store covers the merchant and the processor ledger, not the credential provider, so an AP2
+  purchase across several server processes would need the credential provider as its own service.
+- **The Stripe call runs inside the write transaction,** which holds the writer lock for a Stripe
+  round trip. Correct, but slow at volume (see LOAD_RESULTS.md). A charge the rail made just before a
+  crash, with no retry from the client, has no order; finding those is a reconciliation job that is not
+  built.
 - **The 24-hour cap on open mandates is this project's policy.** AP2 recommends a short expiry but
   does not set a limit.
 - **Address matching is exact on purpose.** Street lines, unit, postal code and country are compared;

@@ -32,7 +32,12 @@ merchant up to both.
 - **Order webhooks.** Every order change goes to the agent platform as a signed ACP webhook (full
   Order snapshot, HMAC `Merchant-Signature`), with retries and backoff, dead-lettering, per-order
   ordering, and a reference receiver that refuses forged, stale and replayed events.
-- **A safety suite.** 359 tests that break one input at a time, so the integration can be shipped
+- **Durable, and safe with several processes.** With `--db`, the state, the ledger and the webhook
+  outbox live in one SQLite file: a `kill -9` loses nothing, and several server processes share the
+  store without charging, refunding or numbering anything twice. Charges and refunds carry Stripe
+  idempotency keys, so a retry after a crash pays once. Under load on one laptop: 40,000 purchases and
+  16,000 racing payment attempts, 0 errors, 0 double charges ([results](docs/LOAD_RESULTS.md)).
+- **A safety suite.** 684 test cases that break one input at a time, so the integration can be shipped
   with evidence, not hope. It is what surfaced the protocol gap below.
 
 ## Run it
@@ -40,6 +45,8 @@ merchant up to both.
 ```bash
 pip install -e ".[dev,serve]"
 shipjack-serve                       # the store over HTTP; ACP discovery at /.well-known/acp.json
+shipjack-serve --db shop.db --workers 4   # state in SQLite, shared by 4 server processes
+shipjack load --db shop.db           # load-test it, then count double charges in the ledger
 # settle through Stripe test mode instead of the simulated processor:
 #   export STRIPE_TEST_KEY="$(security find-generic-password -a "$USER" -s stripe-test-key -w)"
 #   pip install -e ".[stripe]" && shipjack-serve --stripe
@@ -229,8 +236,9 @@ place as over the in-process API, so the delivery finding does not depend on the
 
 ## How it is tested
 
-359 tests, run in CI on Python 3.11 and 3.12. They break one input at a time, so a refusal always points
-at one named check.
+684 test cases, run in CI on Python 3.11 and 3.12. They break one input at a time, so a refusal always
+points at one named check. The 253 tests that build a store run twice: once with the state in memory,
+once in a SQLite file.
 
 - `tests/test_conformance.py`: the AP2 MUSTs around mandate chains. Wrong audience, wrong or reused
   nonce, a key nobody trusts, an expired or too-long-lived mandate, a tampered or changed checkout, an
@@ -251,6 +259,10 @@ at one named check.
 - `tests/test_stripe.py` and `tests/test_lifecycle.py`: Stripe settlement and refunds (against a fake
   Stripe, plus live tests that run only with a test key), refund limits, concurrent refunds, dispute
   evidence, the audit trail, and that an agent platform cannot move money or goods.
+- `tests/test_store.py`: a restart loses nothing; a failed change leaves nothing behind; a crash after
+  Stripe charged or refunded does not charge or refund twice on retry; real OS processes racing to pay
+  one session, refund one order, number sessions or send webhooks never double anything (and these
+  tests fail with the transaction switched off). `tests/test_load.py` checks the load tool itself.
 - `tests/test_webhooks.py`: every webhook body validates against the ACP 2026-04-17 schema (vendored
   in `tests/spec/`); the signature is the spec's construction and a missing, malformed, stale, forged
   or tampered one is refused; retries, backoff, dead-lettering and per-order ordering, also with 20

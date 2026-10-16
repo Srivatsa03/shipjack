@@ -49,7 +49,7 @@ class StripeProcessor(Processor):
             raise ValueError(f"set {var} to a Stripe test secret key (sk_test_...)")
         return cls(api_key=key, **kwargs)
 
-    def _settle(self, amount: int, currency: str, reference: str, method: str) -> str:
+    def _settle(self, amount: int, currency: str, reference: str, method: str, idempotency_key: str = "") -> str:
         try:
             import stripe
         except ImportError:  # pragma: no cover - exercised only without the extra installed
@@ -60,7 +60,8 @@ class StripeProcessor(Processor):
             intent = payment_intents.create(params={
                 "amount": amount, "currency": currency.lower(), "payment_method": self.payment_method,
                 "confirm": True, "automatic_payment_methods": {"enabled": True, "allow_redirects": "never"},
-                "metadata": {"reference": reference[:400], "method": method}})
+                "metadata": {"reference": reference[:400], "method": method}},
+                **_options(idempotency_key))
         except Exception as exc:  # stripe.error.CardError and friends: a declined or invalid charge
             raise PaymentError("payment_declined", f"stripe declined: {_scrub(str(exc))}") from None
         if intent.status != "succeeded":
@@ -68,7 +69,7 @@ class StripeProcessor(Processor):
         self.settlements.append({"id": intent.id, "amount": amount, "currency": currency, "reference": reference})
         return intent.id
 
-    def _refund_rail(self, psp_ref: str, amount: int, currency: str) -> str:
+    def _refund_rail(self, psp_ref: str, amount: int, currency: str, idempotency_key: str = "") -> str:
         if not psp_ref:
             return ""  # nothing settled on the rail (e.g. a simulated charge); nothing to refund there
         try:
@@ -78,10 +79,16 @@ class StripeProcessor(Processor):
         client = stripe.StripeClient(self.api_key)
         refunds = getattr(getattr(client, "v1", None), "refunds", None) or client.refunds
         try:
-            refund = refunds.create(params={"payment_intent": psp_ref, "amount": amount})
+            refund = refunds.create(params={"payment_intent": psp_ref, "amount": amount}, **_options(idempotency_key))
         except Exception as exc:
             raise PaymentError("processing_error", f"stripe refund failed: {_scrub(str(exc))}") from None
         return refund.id
+
+
+def _options(idempotency_key: str) -> dict:
+    """Stripe keeps an idempotency key for 24 hours: a retried request with the same key returns the
+    first result instead of charging or refunding again."""
+    return {"options": {"idempotency_key": idempotency_key}} if idempotency_key else {}
 
 
 def _scrub(text: str) -> str:
