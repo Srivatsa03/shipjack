@@ -19,7 +19,7 @@ from langgraph.types import Command
 from shipjack.assistant.api import store_policies
 from shipjack.assistant.graph import Deps, build_graph, check_checkout, make_messages
 from shipjack.assistant.models import Models, ScriptedChat, call, say
-from shipjack.assistant.store_client import StoreClient, StoreMCP
+from shipjack.assistant.store_client import StoreClient, StoreError, StoreMCP
 from shipjack.http import create_app
 from shipjack.world import build
 
@@ -407,3 +407,41 @@ def test_a_pasted_key_with_a_trailing_newline_still_works(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test_key_123\n")
     model = chat_model("groq", "openai/gpt-oss-120b")
     assert model.openai_api_key.get_secret_value() == "gsk_test_key_123"
+
+
+# ---- the store's identity (free hosting: the store may be asleep when the assistant starts) ----------
+
+
+async def test_a_store_unknown_at_startup_is_asked_at_purchase_time():
+    shop = Shop(buy_hub_script())
+    shop.deps.discovery.clear()  # the assistant started while the store was asleep
+    await shop.say("buy a hub")
+    [card] = await shop.pending()
+    assert card["total"] == 3499 and shop.deps.discovery["seller"]["id"] == "northwind"
+
+
+async def test_the_merchant_check_still_runs_on_a_seller_learned_late():
+    shop = Shop(buy_hub_script())
+    shop.deps.discovery.clear()
+
+    async def impostor():
+        return {"seller": {"id": "northwlnd"}}
+
+    shop.deps.store.discovery = impostor
+    out = await shop.say("buy a hub")
+    assert "different merchant" in shop.last(out) and await shop.pending() == []
+    assert not shop.world.processor.charges
+
+
+async def test_no_checkout_starts_when_the_store_cannot_be_identified():
+    shop = Shop(buy_hub_script())
+    shop.deps.discovery.clear()
+
+    async def asleep():
+        raise StoreError("unreachable", "store unreachable: ReadTimeout")
+
+    shop.deps.store.discovery = asleep
+    out = await shop.say("buy a hub")
+    assert "couldn't confirm the store's identity" in shop.last(out) and await shop.pending() == []
+    assert "cs_northwind_1" not in shop.merchant.sessions  # no checkout session was ever created
+    assert not shop.world.processor.charges

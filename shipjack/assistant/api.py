@@ -36,7 +36,7 @@ from langgraph.types import Command
 from ..catalog import address_problems
 from ..webhooks import SIGNATURE_HEADER, SignatureError, _event_problem, verify
 from .db import AssistantDB
-from .graph import Deps, build_graph, make_messages
+from .graph import Deps, build_graph, known_seller, make_messages
 from .models import text_of
 
 log = logging.getLogger("shipjack.assistant")
@@ -138,10 +138,12 @@ def create_app(settings: Settings | None = None, *, deps: Deps | None = None) ->
             deps.orders_for, deps.record_order = db.order_ids, _recorder(db)
         state.update(db=db, graph=build_graph(deps, checkpointer=saver), deps=deps)
         sweeper = asyncio.create_task(sweep())
+        waker = asyncio.create_task(_wake_store(deps))
         try:
             yield
         finally:
             sweeper.cancel()
+            waker.cancel()
             for task in list(state["tasks"]):
                 task.cancel()
             await pool.close()
@@ -464,14 +466,20 @@ async def _default_deps(settings: Settings, db: AssistantDB) -> Deps:
     from .models import Models
     from .store_client import StoreClient, StoreMCP
     store = StoreClient(settings.store_url, settings.store_token, settings.operator_token)
-    try:
-        discovery = await store.discovery()
-    except Exception:  # noqa: BLE001 - the store may start after the assistant; the seller check is skipped then
-        log.warning("store discovery failed at %s; the merchant-id check is off until restart", settings.store_url)
-        discovery = {}
     mcp = StoreMCP(settings.store_url.rstrip("/") + "/mcp", settings.store_token)
     return Deps(store=store, mcp=mcp, models=Models.from_env(), payment=DEMO_CARD, orders_for=db.order_ids,
-                record_order=_recorder(db), policies=store_policies(mcp), discovery=discovery)
+                record_order=_recorder(db), policies=store_policies(mcp))  # the seller is learned by _wake_store
+
+
+async def _wake_store(deps: Deps, tries: int = 12, pause_s: float = 10.0) -> None:
+    """Learn who the store is as soon as the assistant starts, without holding up the start. On free hosting
+    both services sleep when idle and a visitor wakes only this one; this request wakes the store too, so it
+    is up by the visitor's first purchase. Until it answers, purchases stop before checkout (known_seller)."""
+    for _ in range(tries):
+        if await known_seller(deps):
+            return
+        await asyncio.sleep(pause_s)
+    log.warning("the store didn't say who it is after %d tries; each purchase will ask again", tries)
 
 
 def store_policies(mcp):

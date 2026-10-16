@@ -70,8 +70,7 @@ class StoreClient:
 
     # ---- discovery, over REST (used by deterministic steps) ----------------------------------
     async def discovery(self) -> dict:
-        async with self._client() as client:
-            return (await client.get("/.well-known/acp.json")).json()
+        return await self._send("GET", "/.well-known/acp.json")  # retried like every other call
 
     async def product(self, product_id: str) -> dict:
         return await self._send("GET", f"/products/{product_id}")

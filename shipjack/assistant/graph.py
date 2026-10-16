@@ -274,6 +274,14 @@ def build_graph(deps: Deps, checkpointer=None):
             product = await deps.store.product(pid)
         except StoreError as exc:
             return back(f"{exc.code}: {exc}")
+        seller = await known_seller(deps)
+        if seller is None:  # fail closed: the merchant check is never skipped
+            _emit("checkout_refused", problems=["the store's identity couldn't be confirmed"])
+            return {"messages": [*replies, ToolMessage("refused: the store's identity couldn't be confirmed",
+                                                       tool_call_id=proposal["id"]),
+                                 AIMessage("I couldn't confirm the store's identity just now, so I stopped before "
+                                           "starting a checkout. Nothing was charged. Please try again in a minute.")],
+                    "proposal": None, "checkout": None, "route": "done"}
         user = state["user"]
         fulfillment = {"name": user.get("name", ""), "email": user.get("email", ""), "address": user.get("address")}
         if product.get("kind") == "digital":
@@ -283,7 +291,7 @@ def build_graph(deps: Deps, checkpointer=None):
                                                        key=f"checkout:{_thread(config)}:{proposal['id']}")
         except StoreError as exc:
             return back(f"{exc.code}: {exc}")
-        problems = check_checkout(session, product, qty, user, deps.discovery.get("seller"))
+        problems = check_checkout(session, product, qty, user, seller)
         if problems:
             _emit("checkout_refused", session=session.get("id"), problems=problems)
             try:
@@ -508,6 +516,20 @@ def sanitize(messages: list[BaseMessage]) -> list[BaseMessage]:
         else:
             out.append(m)
     return out
+
+
+async def known_seller(deps: Deps) -> dict | None:
+    """The store's seller record, from its discovery document (/.well-known/acp.json), fetched once and kept.
+    On free hosting the store can be asleep when the assistant starts, so a missing record is asked for
+    again here; None means it still couldn't be confirmed, and then no checkout starts."""
+    if not deps.discovery.get("seller"):
+        try:
+            found = await deps.store.discovery()
+        except Exception:  # noqa: BLE001 - any failure means "not confirmed", which stops the purchase
+            return None
+        if isinstance(found, dict) and isinstance(found.get("seller"), dict):
+            deps.discovery.update(found)
+    return deps.discovery.get("seller")
 
 
 def check_checkout(session: dict, product: dict, quantity: int, user: dict, seller: dict | None) -> list[str]:
