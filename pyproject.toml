@@ -29,10 +29,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "jsonschema>=4.20", "uvicorn>=0.30", "psycopg[binary]>=3.2"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "jsonschema>=4.20", "uvicorn>=0.30", "psycopg[binary]>=3.2",
+       "shipjack[assistant]"]
 serve = ["uvicorn>=0.30"]
 stripe = ["stripe>=11"]
 postgres = ["psycopg[binary]>=3.2"]
+assistant = ["langgraph>=1.0", "langgraph-checkpoint-postgres>=2.0", "langchain-openai>=1.0",
+             "langchain-google-genai>=4.0", "mcp>=1.20",
+             "psycopg[binary,pool]>=3.2", "uvicorn>=0.30"]
 
 [project.urls]
 Homepage = "https://github.com/Srivatsa03/shipjack"
@@ -45,9 +49,15 @@ shipjack = "shipjack.cli:main"
 shipjack-mcp = "shipjack.mcp:main"
 shipjack-serve = "shipjack.http:main"
 shipjack-receiver = "shipjack.webhooks:main"
+shipjack-assistant = "shipjack.assistant.api:main"
 
 [tool.setuptools]
-packages = ["shipjack"]
+packages = ["shipjack", "shipjack.assistant"]
+
+[tool.setuptools.package-data]
+shipjack = ["data/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

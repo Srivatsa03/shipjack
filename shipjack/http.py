@@ -24,7 +24,7 @@ import logging
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from .mandates import FULFILLMENT
 from .merchant import ACP_API_VERSION, CheckoutError, Merchant
@@ -178,6 +178,47 @@ def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[st
     async def ap2(request: Request, session_id: str):
         return await guarded(request, 200, lambda _: merchant.ap2_checkout(session_id))
 
+    # ---- MCP over Streamable HTTP: the same store as MCP tools, for agents that speak MCP -----------
+    from .mcp import MCPStore
+    mcp_by_caller: dict[str, MCPStore] = {}
+
+    @app.post("/mcp")
+    async def mcp(request: Request):
+        """MCP's Streamable HTTP transport, answering every request with plain JSON (no SSE stream).
+
+        The bearer token authenticates the caller, as on the REST API; idempotency keys in ``meta`` are
+        scoped to that caller. A notification gets 202 and no body, as the transport requires.
+        """
+        auth = request.headers.get("authorization", "")
+        presented = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else None
+        caller = tokens.get(presented) or (f"operator:{operators[presented]}" if presented in operators else None)
+        if caller is None:
+            return _error(401, "unauthorized", "a valid Authorization: Bearer token is required")
+        try:
+            message = json.loads(await request.body())
+        except ValueError:
+            return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}},
+                                status_code=400)
+        store = mcp_by_caller.setdefault(caller, MCPStore(merchant))
+        batch = message if isinstance(message, list) else [message]
+        replies = []
+        for item in batch:
+            try:
+                reply = store.handle(item) if isinstance(item, dict) else \
+                    {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+            except Exception:  # a fault is a JSON-RPC internal error that says nothing about the inside
+                log.exception("unhandled MCP error")
+                reply = {"jsonrpc": "2.0", "id": item.get("id"), "error": {"code": -32603, "message": "internal error"}}
+            if reply is not None:
+                replies.append(reply)
+        if not replies:
+            return Response(status_code=202)
+        return JSONResponse(replies if isinstance(message, list) else replies[0])
+
+    @app.get("/mcp")
+    async def mcp_stream():
+        return Response(status_code=405, headers={"Allow": "POST"})  # no server-initiated stream
+
     # ---- after the order: status for the platform; refunds, fulfillment and evidence for operators ----
 
     @app.get("/orders/{order_id}")
@@ -289,10 +330,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--token", default="demo-token", help="the bearer token an agent platform presents")
     parser.add_argument("--stripe", action="store_true", help="settle through Stripe test mode (needs STRIPE_TEST_KEY)")
     parser.add_argument("--webhook-url", help="send signed ACP order events here (secret: SHIPJACK_WEBHOOK_SECRET)")
-    parser.add_argument("--db", help="keep the store's state in this SQLite file (survives restarts)")
+    parser.add_argument("--db", help="keep the store's state in a SQLite file or a postgresql:// URL (or set SHIPJACK_DB)")
     parser.add_argument("--workers", type=int, default=1, help="server processes sharing --db (default 1)")
     args = parser.parse_args(argv)
-    if args.workers > 1 and not args.db:
+    import os
+    if args.workers > 1 and not (args.db or os.environ.get("SHIPJACK_DB")):
         import sys
         print("shipjack-serve: --workers above 1 needs --db, so the processes share one store", file=sys.stderr)
         return 2
@@ -304,7 +346,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     import os
     os.environ.update({"SHIPJACK_TOKEN": args.token, "SHIPJACK_STRIPE": "1" if args.stripe else "",
-                       "SHIPJACK_WEBHOOK_URL": args.webhook_url or "", "SHIPJACK_DB": args.db or ""})
+                       "SHIPJACK_WEBHOOK_URL": args.webhook_url or os.environ.get("SHIPJACK_WEBHOOK_URL", ""),
+                       "SHIPJACK_DB": args.db or os.environ.get("SHIPJACK_DB", "")})
+    args.db = os.environ["SHIPJACK_DB"] or None
     try:
         app = app_from_env()  # also checks the configuration before any worker starts
     except ValueError as exc:
@@ -313,7 +357,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     rail = "Stripe test mode" if args.stripe else "simulated processor"
     hooks = f"; order webhooks to {args.webhook_url}" if args.webhook_url else ""
-    store = f"; state in {args.db}" + (f", {args.workers} workers" if args.workers > 1 else "") if args.db else ""
+    import re
+    shown = re.sub(r"//([^:/@]+):[^@]*@", r"//\1:***@", args.db or "")  # never print a database password
+    store = f"; state in {shown}" + (f", {args.workers} workers" if args.workers > 1 else "") if args.db else ""
     print(f"shipjack store on http://{args.host}:{args.port}  ({rail}{hooks}{store}; "
           "ACP discovery at /.well-known/acp.json)", flush=True)
     if args.workers > 1:
