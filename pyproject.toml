@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-checkout"
+version = "0.1.0.dev0"
+description = "An agent-ready store and shopping agent that pay through AP2 signed mandates, with an attack bench for fooled shopping agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Srivatsa Kamballa" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+  "Topic :: Office/Business :: Financial",
+]
+keywords = ["ap2", "acp", "agentic-commerce", "llm", "agents", "security", "sd-jwt", "payments"]
+dependencies = [
+  # Google's AP2 SDK is not on PyPI; pin the v0.2 commit this code was written against.
+  "ap2 @ git+https://github.com/google-agentic-commerce/AP2.git@e1ea56db72a6385bce3e5c1112b3a56ce60acb43",
+  "fastapi>=0.110",
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/Srivatsa03/agent-checkout"
+Repository = "https://github.com/Srivatsa03/agent-checkout"
+"AP2 specification" = "https://github.com/google-agentic-commerce/AP2"
+"ACP specification" = "https://github.com/agentic-commerce-protocol/agentic-commerce-protocol"
+
+[project.scripts]
+agent-checkout = "agent_checkout.cli:main"
+
+[tool.setuptools]
+packages = ["agent_checkout"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
