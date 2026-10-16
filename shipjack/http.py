@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -23,6 +24,7 @@ from fastapi.responses import JSONResponse
 from .merchant import ACP_API_VERSION, CheckoutError, Merchant
 
 SUPPORTED_VERSIONS = [ACP_API_VERSION]
+log = logging.getLogger("shipjack.http")
 
 
 def _error(status: int, code: str, message: str, param: str | None = None, type_: str = "invalid_request",
@@ -70,6 +72,8 @@ def create_app(merchant: Merchant, tokens: dict[str, str]) -> FastAPI:
                 body = json.loads(raw) if raw else {}
             except ValueError:
                 return _error(400, "invalid", "request body is not valid JSON")
+            if not isinstance(body, dict):
+                return _error(400, "invalid", "request body must be a JSON object")
             key = request.headers.get("idempotency-key")
             if not key:
                 return _error(400, "idempotency_key_required", "Idempotency-Key header is required on all POST requests")
@@ -87,6 +91,11 @@ def create_app(merchant: Merchant, tokens: dict[str, str]) -> FastAPI:
             code, payload = status, action(body)
         except CheckoutError as exc:
             code, payload = (404 if exc.code == "not_found" else 400), exc.body()
+        except _NotAllowed as exc:
+            code, payload = 405, {"type": "invalid_request", "code": "invalid", "message": f"session is already {exc}"}
+        except Exception:  # a fault is a flat 500 that says nothing about the inside, and is never remembered
+            log.exception("unhandled error in %s %s", request.method, request.url.path)
+            return _error(500, "internal_error", "the request could not be processed", type_="processing_error")
         headers = {}
         if request.method == "POST":
             headers["Idempotency-Key"] = key
@@ -111,7 +120,7 @@ def create_app(merchant: Merchant, tokens: dict[str, str]) -> FastAPI:
     @app.post("/checkout_sessions")
     async def create(request: Request):
         return await guarded(request, 201, lambda b: merchant.create_session(
-            b.get("items") or [], fulfillment_details=b.get("fulfillment_details"), buyer=b.get("buyer")))
+            b.get("items"), fulfillment_details=b.get("fulfillment_details"), buyer=b.get("buyer")))
 
     @app.post("/checkout_sessions/{session_id}")
     async def update(request: Request, session_id: str):
@@ -125,7 +134,7 @@ def create_app(merchant: Merchant, tokens: dict[str, str]) -> FastAPI:
 
     @app.post("/checkout_sessions/{session_id}/complete")
     async def complete(request: Request, session_id: str):
-        return await guarded(request, 200, lambda b: merchant.complete_session(session_id, b.get("payment_data") or {}))
+        return await guarded(request, 200, lambda b: merchant.complete_session(session_id, b.get("payment_data")))
 
     @app.post("/checkout_sessions/{session_id}/cancel")
     async def cancel(request: Request, session_id: str):
@@ -134,10 +143,7 @@ def create_app(merchant: Merchant, tokens: dict[str, str]) -> FastAPI:
             if session is not None and session.status in ("completed", "canceled"):
                 raise _NotAllowed(session.status)
             return merchant.cancel_session(session_id)
-        try:
-            return await guarded(request, 200, act)
-        except _NotAllowed as exc:
-            return _error(405, "invalid", f"session is already {exc}")
+        return await guarded(request, 200, act)
 
     @app.post("/checkout_sessions/{session_id}/ap2")
     async def ap2(request: Request, session_id: str):

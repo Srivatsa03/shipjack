@@ -220,11 +220,18 @@ class Shop:
 
     @staticmethod
     def _fulfillment(args: dict) -> dict | None:
+        """The model's ship_to / email as ACP fulfillment_details. Nulls are dropped and numbers become text
+        (models send a postal code as 60607); anything else is passed on as given so the store can refuse it."""
         out = {}
-        if isinstance(args.get("ship_to"), dict):
-            out["address"] = {k: str(v) for k, v in args["ship_to"].items()}
-        if args.get("email"):
-            out["email"] = str(args["email"])
+        ship = args.get("ship_to")
+        if isinstance(ship, dict):
+            out["address"] = {k: (str(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v)
+                              for k, v in ship.items() if v is not None}
+        elif ship is not None:
+            out["address"] = ship
+        email = args.get("email")
+        if email is not None:
+            out["email"] = str(email) if isinstance(email, (int, float)) and not isinstance(email, bool) else email
         return out or None
 
     def _summary(self, merchant, session: dict) -> dict:

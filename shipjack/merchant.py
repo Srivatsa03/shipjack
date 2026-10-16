@@ -25,6 +25,7 @@ from .mandates import FULFILLMENT, TrustList, digest, error_code, verify_checkou
 from .psp import PaymentError, Processor
 
 ACP_API_VERSION = "2026-04-17"
+MAX_QUANTITY = 1000  # per line; a store caps what one order can ask for
 
 
 class CheckoutError(Exception):
@@ -91,19 +92,24 @@ class Merchant:
     # ---- ACP checkout sessions -------------------------------------------------------------------
     def create_session(self, items: list[dict], fulfillment_details: dict | None = None,
                        buyer: dict | None = None) -> dict:
+        details, buyer = self._details(fulfillment_details), self._buyer(buyer)
+        cart = self._items(items)
         self._count += 1
-        session = Session(f"cs_{self.id}_{self._count}", [], Fulfillment.from_acp(fulfillment_details), buyer)
-        session.items = self._items(items)
+        session = Session(f"cs_{self.id}_{self._count}", cart, details, buyer)
         self.sessions[session.id] = session
         return self._render(self._refresh(session))
 
     def update_session(self, session_id: str, items: list[dict] | None = None,
                        fulfillment_details: dict | None = None, buyer: dict | None = None) -> dict:
         session = self._open(session_id)
-        if items is not None:
-            session.items = self._items(items)
-        if fulfillment_details is not None:
-            session.fulfillment = Fulfillment.from_acp(fulfillment_details)
+        # validate everything first: a bad field must not leave the session half changed
+        cart = self._items(items) if items is not None else None
+        details = self._details(fulfillment_details) if fulfillment_details is not None else None
+        buyer = self._buyer(buyer) if buyer is not None else None
+        if cart is not None:
+            session.items = cart
+        if details is not None:
+            session.fulfillment = details
         if buyer is not None:
             session.buyer = buyer
         return self._render(self._refresh(session))
@@ -122,17 +128,22 @@ class Merchant:
         session = self._open(session_id)
         if session.status != "ready_for_payment":
             raise CheckoutError("invalid", "session is not ready for payment", "$.status")
+        if not isinstance(payment_data, dict):
+            raise CheckoutError("invalid", "payment_data must be an object", "$.payment_data")
         handler = payment_data.get("handler_id")
         amount = self._total(session) + self.surcharge
         try:
             if handler == "card":
-                number = (payment_data.get("instrument") or {}).get("credential", {}).get("number", "")
-                charge = self.processor.charge_card(self.account, number, amount, "USD", session.id)
+                instrument = payment_data.get("instrument")
+                credential = instrument.get("credential") if isinstance(instrument, dict) else None
+                number = credential.get("number") if isinstance(credential, dict) else None
+                charge = self.processor.charge_card(self.account, number if isinstance(number, str) else "", amount,
+                                                    "USD", session.id)
                 receipt = None
             elif handler == "ap2":
                 charge, receipt = self._complete_ap2(session, payment_data, amount)
             else:
-                raise CheckoutError("invalid", f"unsupported payment handler {handler!r}", "$.payment_data.handler_id")
+                raise CheckoutError("invalid", "unsupported payment handler", "$.payment_data.handler_id")
         except PaymentError as exc:
             session.messages = [{"type": "error", "code": "payment_declined", "content_type": "plain",
                                  "content": str(exc)}]
@@ -164,7 +175,8 @@ class Merchant:
     def _complete_ap2(self, session: Session, payment_data: dict, amount: int):
         if not session.checkout_jwt or not session.nonce:
             raise PaymentError("invalid_mandate", "no signed checkout to approve: call ap2_checkout first")
-        mandate, nonce = payment_data.get("checkout_mandate", ""), session.nonce
+        text = lambda v: v if isinstance(v, str) else ""  # noqa: E731  (wrong types are treated as missing)
+        mandate, nonce = text(payment_data.get("checkout_mandate")), session.nonce
         session.nonce = None  # single use, success or not
         if self.verifies_mandates:
             _, violations = verify_checkout(mandate, self.trust, aud=self.id, nonce=nonce,
@@ -172,8 +184,9 @@ class Merchant:
             if violations:
                 self._receipt(mandate, "Error", error=violations[0].split(":")[0], detail="; ".join(violations))
                 raise PaymentError(error_code(violations), "; ".join(violations))
-        charge = self.processor.charge_token(self.account, payment_data.get("payment_token", ""), amount, "USD",
-                                             digest(session.checkout_jwt), payment_data.get("open_checkout_hash"))
+        charge = self.processor.charge_token(self.account, text(payment_data.get("payment_token")), amount, "USD",
+                                             digest(session.checkout_jwt),
+                                             text(payment_data.get("open_checkout_hash")) or None)
         return charge, self._receipt(mandate, "Success", order_id=f"ord_{session.id}")
 
     def _receipt(self, mandate: str, status: str, **extra) -> dict:
@@ -189,16 +202,41 @@ class Merchant:
         return receipt
 
     # ---- internals -------------------------------------------------------------------------------
-    def _items(self, items: list[dict]) -> list[tuple[str, int]]:
-        out = []
-        for i, item in enumerate(items or []):
-            pid, qty = item.get("id"), int(item.get("quantity", 1))
-            if pid not in self.products:
-                raise CheckoutError("invalid", f"no product {pid!r} at {self.info['name']}", f"$.items[{i}].id")
+    def _items(self, items) -> list[tuple[str, int]]:
+        """Validate the requested lines. The same product on two lines becomes one line with the quantities added."""
+        if not isinstance(items, list):
+            raise CheckoutError("invalid", "items must be an array", "$.items")
+        merged: dict[str, int] = {}
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise CheckoutError("invalid", "each item must be an object", f"$.items[{i}]")
+            pid = item.get("id")
+            if not isinstance(pid, str) or pid not in self.products:
+                raise CheckoutError("invalid", f"no product {str(pid)[:60]!r} at {self.info['name']}", f"$.items[{i}].id")
+            qty = item.get("quantity", 1)
+            if isinstance(qty, float) and qty.is_integer():
+                qty = int(qty)  # JSON writes 1 as 1.0 in some clients
+            if isinstance(qty, bool) or not isinstance(qty, int):
+                raise CheckoutError("invalid", "quantity must be a whole number", f"$.items[{i}].quantity")
             if qty < 1:
                 raise CheckoutError("invalid", "quantity must be at least 1", f"$.items[{i}].quantity")
-            out.append((pid, qty))
-        return out
+            merged[pid] = merged.get(pid, 0) + qty
+            if merged[pid] > MAX_QUANTITY:
+                raise CheckoutError("invalid", f"at most {MAX_QUANTITY} of one item per order", f"$.items[{i}].quantity")
+        return list(merged.items())
+
+    @staticmethod
+    def _details(data) -> Fulfillment:
+        try:
+            return Fulfillment.from_acp(data)
+        except ValueError as exc:
+            raise CheckoutError("invalid", str(exc), "$.fulfillment_details") from None
+
+    @staticmethod
+    def _buyer(data) -> dict | None:
+        if data is not None and not isinstance(data, dict):
+            raise CheckoutError("invalid", "buyer must be an object", "$.buyer")
+        return data
 
     def _session(self, session_id: str) -> Session:
         if session_id not in self.sessions:

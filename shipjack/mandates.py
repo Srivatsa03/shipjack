@@ -26,7 +26,7 @@ from ap2.sdk.utils import b64url_decode, compute_sha256_b64url
 from jwcrypto.jwk import JWK
 from pydantic import BaseModel, Field
 
-from .catalog import address_key, email_key
+from .catalog import address_key, address_problems, email_key
 
 FULFILLMENT = "io.github.srivatsa03.fulfillment"
 SDK_CHECKOUT_TYPES = {"checkout.allowed_merchants", "checkout.line_items"}
@@ -70,10 +70,16 @@ def check_fulfillment(constraint: Fulfillment, checkout: dict) -> list[str]:
     if not address and not email:
         return ["fulfillment: checkout names no destination"]
     out = []
-    if address and address_key(address) not in {address_key(a) for a in constraint.ship_to}:
-        out.append(f"fulfillment: ship-to {address.get('line_one', '?')}, {address.get('city', '?')} is not allowed")
-    if email and email_key(email) not in {email_key(e) for e in constraint.deliver_to}:
-        out.append(f"fulfillment: delivery email {email} is not allowed")
+    if address:
+        problems = address_problems(address)
+        if problems:
+            out.append(f"fulfillment: {problems[0]}")
+        elif address_key(address) not in {address_key(a) for a in constraint.ship_to}:
+            out.append(f"fulfillment: ship-to {address.get('line_one', '?')}, {address.get('city', '?')} is not allowed")
+    if email:
+        allowed = {k for k in map(email_key, constraint.deliver_to) if k}
+        if not email_key(email) or email_key(email) not in allowed:
+            out.append(f"fulfillment: delivery email {str(email)[:80]} is not allowed")
     return out
 
 
