@@ -3,9 +3,9 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_checkout.http import create_app
-from agent_checkout.merchant import ACP_API_VERSION
-from agent_checkout.remote import RemoteMerchant
+from shipjack.http import create_app
+from shipjack.merchant import ACP_API_VERSION
+from shipjack.remote import RemoteMerchant
 
 from conftest import DOCK, HOME, HUB, hub_intent
 

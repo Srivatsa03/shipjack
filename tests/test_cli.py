@@ -1,6 +1,6 @@
 import json
 
-from agent_checkout.cli import main
+from shipjack.cli import main
 
 
 def test_bench_prints_the_scripted_table(tmp_path, capsys):

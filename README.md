@@ -1,9 +1,10 @@
-# agent-checkout
+# shipjack
 
-[![tests](https://github.com/Srivatsa03/agent-checkout/actions/workflows/tests.yml/badge.svg)](https://github.com/Srivatsa03/agent-checkout/actions/workflows/tests.yml)
+[![tests](https://github.com/Srivatsa03/shipjack/actions/workflows/tests.yml/badge.svg)](https://github.com/Srivatsa03/shipjack/actions/workflows/tests.yml)
 
 An agent-ready store, a shopping agent that pays through AP2 signed mandates, and an attack bench
-that checks how far a fooled shopping agent can go.
+that checks how far a fooled shopping agent can go. It is named after the attack it found: a fooled
+agent pays the right store the right price, exactly once, and ships the order to someone else.
 
 AI agents can now buy things. OpenAI and Stripe's Agentic Commerce Protocol (ACP) gives merchants a
 checkout API that agents call. Google's Agent Payments Protocol (AP2, v0.2 since April 2026) makes
@@ -26,7 +27,7 @@ and one extension.
 
 ## Result
 
-What gets through when the agent does exactly what the page says (`agent-checkout bench`, no model):
+What gets through when the agent does exactly what the page says (`shipjack bench`, no model):
 
 ```
                           Card (no protocol)    AP2 v0.2              AP2 + extensions
@@ -73,7 +74,7 @@ refused before anything is signed.
 
 ## With real models
 
-`agent-checkout llm-bench` puts a real model in the agent's seat. Each trial runs the three payment
+`shipjack llm-bench` puts a real model in the agent's seat. Each trial runs the three payment
 profiles in lockstep: one model output serves all three until a tool result differs (a payment one
 profile refuses), so the profiles are compared on the same fooled agent.
 
@@ -108,7 +109,7 @@ What AP2 does when it falls does not: the money is bounded and the delivery is n
 
 Full tables and every transcript: [docs/LLM_RESULTS.md](docs/LLM_RESULTS.md),
 [docs/DELIVERY_RESULTS.md](docs/DELIVERY_RESULTS.md) and their `.json` files.
-`agent-checkout llm-bench --rescore docs/llm_results.json` rebuilds them with no model call. Runs for
+`shipjack llm-bench --rescore docs/llm_results.json` rebuilds them with no model call. Runs for
 gpt-oss-20b and Qwen 3.8 27B are in progress.
 
 ## Try it
@@ -116,8 +117,8 @@ gpt-oss-20b and Qwen 3.8 27B are in progress.
 ```bash
 pip install -e ".[dev]"
 python -m pytest -q                      # protocol, harness and REST API tests
-agent-checkout bench                     # the table above, with a scripted fully fooled agent
-agent-checkout demo ship-redirect        # one scenario, step by step, under every profile
+shipjack bench                     # the table above, with a scripted fully fooled agent
+shipjack demo ship-redirect        # one scenario, step by step, under every profile
 ```
 
 With a real model (any OpenAI-compatible API with tool calling; Groq by default). The key is read
@@ -125,15 +126,15 @@ from the environment and sent only to the provider:
 
 ```bash
 export GROQ_API_KEY=...
-agent-checkout demo ship-redirect --model openai/gpt-oss-120b
-agent-checkout llm-bench --models openai/gpt-oss-120b --trials 5 --json runs/120b.json
-agent-checkout llm-bench --rescore runs/120b.json   # rebuild every table, no model calls
+shipjack demo ship-redirect --model openai/gpt-oss-120b
+shipjack llm-bench --models openai/gpt-oss-120b --trials 5 --json runs/120b.json
+shipjack llm-bench --rescore runs/120b.json   # rebuild every table, no model calls
 ```
 
 ### The store as an ACP API
 
 ```python
-from agent_checkout.http import create_app
+from shipjack.http import create_app
 app = create_app(merchant, tokens={"platform-token": "agent-platform"})
 ```
 

@@ -8,8 +8,8 @@ from ap2.sdk.generated.types.checkout import Checkout
 from ap2.sdk.jwt_helper import verify_jwt
 from ap2.sdk.mandate import MandateClient
 
-from agent_checkout.mandates import FULFILLMENT, digest, jwt_payload
-from agent_checkout.wallet import PROFILES
+from shipjack.mandates import FULFILLMENT, digest, jwt_payload
+from shipjack.wallet import PROFILES
 
 from conftest import ATTACKER_EMAIL, BB_HUB, DM_HUB, DOCK, EMAIL, GIFT, HOME, HUB, gift_intent, hub_intent
 

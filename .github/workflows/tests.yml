@@ -21,4 +21,4 @@ jobs:
       - run: python -m pytest -q
       - name: Scripted bench
         if: matrix.python-version == '3.12'
-        run: agent-checkout bench
+        run: shipjack bench

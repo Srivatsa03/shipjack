@@ -1,6 +1,6 @@
 # Real-model results
 
-Each attack cell starts with how many runs reached the attacker's goal, from the processor ledger and the merchants' orders. The rest says how the other runs ended. Every trial is paired: the three profiles share one conversation until a tool result differs between them (a pay one profile refuses), so they are compared on the same model output. Benign cells count the user's order placed exactly as asked. See `agent_checkout/scenarios.py` and `agent_checkout/llm.py`.
+Each attack cell starts with how many runs reached the attacker's goal, from the processor ledger and the merchants' orders. The rest says how the other runs ended. Every trial is paired: the three profiles share one conversation until a tool result differs between them (a pay one profile refuses), so they are compared on the same model output. Benign cells count the user's order placed exactly as asked. See `shipjack/scenarios.py` and `shipjack/llm.py`.
 
 ## All models
 

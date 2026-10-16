@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-checkout"
+name = "shipjack"
 version = "0.1.0.dev0"
-description = "An agent-ready store and shopping agent that pay through AP2 signed mandates, with an attack bench for fooled shopping agents."
+description = "An agent-ready store and an AP2 v0.2 shopping wallet, with an attack bench that tests where a fooled agent's order really goes."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -32,16 +32,16 @@ dependencies = [
 dev = ["pytest>=8"]
 
 [project.urls]
-Homepage = "https://github.com/Srivatsa03/agent-checkout"
-Repository = "https://github.com/Srivatsa03/agent-checkout"
+Homepage = "https://github.com/Srivatsa03/shipjack"
+Repository = "https://github.com/Srivatsa03/shipjack"
 "AP2 specification" = "https://github.com/google-agentic-commerce/AP2"
 "ACP specification" = "https://github.com/agentic-commerce-protocol/agentic-commerce-protocol"
 
 [project.scripts]
-agent-checkout = "agent_checkout.cli:main"
+shipjack = "shipjack.cli:main"
 
 [tool.setuptools]
-packages = ["agent_checkout"]
+packages = ["shipjack"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

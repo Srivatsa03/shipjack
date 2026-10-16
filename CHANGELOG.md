@@ -17,10 +17,10 @@ First version.
   extensions) checks the merchant's published key and every constraint before the agent key signs.
 - Extension: `io.github.srivatsa03.fulfillment`, a checkout constraint on where goods go (ship-to
   address, delivery email). Verifiers that do not know it fail closed.
-- Bench: 12 scenarios (3 normal purchases, 9 attacks). `agent-checkout bench` runs a fully fooled
-  scripted agent; `agent-checkout llm-bench` puts a real model in the agent's seat with paired runs
+- Bench: 12 scenarios (3 normal purchases, 9 attacks). `shipjack bench` runs a fully fooled
+  scripted agent; `shipjack llm-bench` puts a real model in the agent's seat with paired runs
   across profiles, scored from the processor ledger and orders; `--rescore` rebuilds the tables;
-  `agent-checkout demo` tells one scenario step by step.
+  `shipjack demo` tells one scenario step by step.
 - Real-model results for gpt-oss-120b (Groq), gemini-3.1-flash-lite-preview and gemini-3.8-flash
   (Gemini API): 45 paired trials each in `docs/LLM_RESULTS.md`, and a delivery study (5 variants x 10
   trials) in `docs/DELIVERY_RESULTS.md`, with every transcript in the matching `.json` files.

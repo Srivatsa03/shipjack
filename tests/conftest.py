@@ -1,8 +1,8 @@
 import pytest
 
-from agent_checkout.catalog import Address, Product
-from agent_checkout.surface import Intent
-from agent_checkout.world import Store, build
+from shipjack.catalog import Address, Product
+from shipjack.surface import Intent
+from shipjack.world import Store, build
 
 HOME = Address("Sam Rivera", "1200 W Harrison St", "Chicago", "IL", "60607").to_acp()
 DOCK = Address("Receiving", "77 Dock St", "Gary", "IN", "46402").to_acp()

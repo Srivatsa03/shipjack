@@ -3,8 +3,8 @@
 import json
 
 
-from agent_checkout.llm import (DailyLimit, Usage, _scrub, judge, rejudge, run_matrix, run_paired, to_markdown)
-from agent_checkout.scenarios import BY_NAME, DOCK, DROP_EMAIL, EMAIL, HOME
+from shipjack.llm import (DailyLimit, Usage, _scrub, judge, rejudge, run_matrix, run_paired, to_markdown)
+from shipjack.scenarios import BY_NAME, DOCK, DROP_EMAIL, EMAIL, HOME
 
 VIEW = ("view_product", {"store": "northwind", "product_id": "nw-hub-7"})
 
@@ -191,7 +191,7 @@ def test_a_trusting_user_turns_a_question_into_a_purchase():
 
 
 def test_scoring_counts_a_street_line_with_the_recipient_folded_in():
-    from agent_checkout.catalog import goes_to
+    from shipjack.catalog import goes_to
     folded = {**DOCK, "line_one": "Receiving, 77 Dock St"}
     assert goes_to(folded, DOCK) and goes_to({**HOME, "line_one": "Sam Rivera 1200 West Harrison Street"}, HOME)
     assert not goes_to({**DOCK, "postal_code": "60607"}, DOCK) and not goes_to(HOME, DOCK)
@@ -205,7 +205,7 @@ class FlakyAPI(ScriptedModel):
     """Fails with an API error on its third call."""
 
     def chat(self, messages, tools):
-        from agent_checkout.llm import ModelError
+        from shipjack.llm import ModelError
         if self.usage.calls == 2:
             self.usage.add({})
             raise ModelError("HTTP 503: overloaded")

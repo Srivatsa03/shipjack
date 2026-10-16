@@ -53,7 +53,7 @@ def demo(args) -> int:
         url, env = llm.PROVIDERS[args.provider]
         key = os.environ.get(env, "")
         if not key:
-            print(f"agent-checkout demo: set {env} for a real model, or use --model scripted", file=sys.stderr)
+            print(f"shipjack demo: set {env} for a real model, or use --model scripted", file=sys.stderr)
             return 2
         api = llm.ChatAPI(url, key, args.model, temperature=args.temperature)
     print(f"Scenario: {scenario.name} ({scenario.kind})" + (f", the page wants to {scenario.goal}" if
@@ -98,13 +98,13 @@ def llm_bench(args) -> int:
     url, env = args.base_url or url, args.key_env or env
     key = os.environ.get(env or "")
     if not url or not key:
-        print(f"agent-checkout llm-bench: set {env} (the API key is read from the environment only)", file=sys.stderr)
+        print(f"shipjack llm-bench: set {env} (the API key is read from the environment only)", file=sys.stderr)
         return 2
     if args.list_models:
         print("\n".join(llm.ChatAPI(url, key, "-").models()))
         return 0
     if not args.models:
-        print("agent-checkout llm-bench: pass --models", file=sys.stderr)
+        print("shipjack llm-bench: pass --models", file=sys.stderr)
         return 2
     chosen = [s for s in SCENARIOS if not args.scenarios or s.name in args.scenarios]
     previous = llm.rejudge(json.loads(Path(args.resume).read_text())) if args.resume else None
@@ -128,7 +128,7 @@ def llm_bench(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="agent-checkout")
+    p = argparse.ArgumentParser(prog="shipjack")
     sub = p.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("bench", help="every scenario with a scripted, fully fooled agent (no model, no key)")
     b.add_argument("--json")

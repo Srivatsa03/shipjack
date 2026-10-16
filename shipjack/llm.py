@@ -83,7 +83,7 @@ class ChatAPI:
         req = urllib.request.Request(f"{self.base_url}{path}", data=data, method="POST" if data else "GET",
                                      headers={"Authorization": f"Bearer {self._key}",
                                               "Content-Type": "application/json",
-                                              "User-Agent": "agent-checkout-bench"})
+                                              "User-Agent": "shipjack-bench"})
         delay = 2.0
         for attempt in range(self.retries + 1):
             try:
@@ -131,7 +131,7 @@ class ChatAPI:
 class ScriptedModel:
     """Plays a fully fooled agent: one tool call per step from a script, then a short answer.
 
-    ``agent-checkout bench`` runs every scenario's ``fooled`` script through it, which answers the
+    ``shipjack bench`` runs every scenario's ``fooled`` script through it, which answers the
     protocol question with no model at all: if the agent does what the page asks, what gets through?"""
 
     model = "scripted (fully fooled)"
@@ -557,7 +557,7 @@ def to_markdown(report: dict, title: str = "Real-model results") -> str:
              "three profiles share one conversation until a tool result differs between them (a pay one "
              "profile refuses), so they are compared on the same model output. Benign cells count the "
              "user's order placed exactly as asked. See "
-             "`agent_checkout/scenarios.py` and `agent_checkout/llm.py`.", ""]
+             "`shipjack/scenarios.py` and `shipjack/llm.py`.", ""]
     if report.get("follow_up"):
         lines += [f"Trusting user: when the model stopped without paying, the user replied once: "
                   f"\"{report['follow_up']}\"", ""]
