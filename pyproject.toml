@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "shipjack"
 version = "0.1.0.dev0"
-description = "An agent-ready store and an AP2 v0.2 shopping wallet, with an attack bench that tests where a fooled agent's order really goes."
+description = "A reference integration that makes a merchant agent-ready for AI checkout over ACP and AP2 (REST + MCP, Stripe test-mode settlement), with a safety suite."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -30,6 +30,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+serve = ["uvicorn>=0.30"]
+stripe = ["stripe>=11"]
 
 [project.urls]
 Homepage = "https://github.com/Srivatsa03/shipjack"
@@ -40,6 +42,7 @@ Repository = "https://github.com/Srivatsa03/shipjack"
 [project.scripts]
 shipjack = "shipjack.cli:main"
 shipjack-mcp = "shipjack.mcp:main"
+shipjack-serve = "shipjack.http:main"
 
 [tool.setuptools]
 packages = ["shipjack"]

@@ -4,6 +4,14 @@
 
 ### Added
 
+- **Runnable store** (`shipjack-serve`, `shipjack[serve]`): the ACP REST store over HTTP with a
+  `/.well-known/acp.json` discovery document (transports, versions, payment handlers, extensions).
+- **Stripe test-mode processor** (`shipjack/stripe_psp.py`, `shipjack[stripe]`): settles each order
+  as a confirmed Stripe PaymentIntent in test mode, keeping every AP2 and card check. Refuses a
+  non-test key; a decline leaves the order unpaid and the token unspent. `shipjack-serve --stripe`.
+- **Deployment runbook** ([docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)): how a merchant adopts the
+  integration.
+
 - **Human-present (Direct) mode** (`shipjack/direct.py`): the user signs each purchase on a trusted
   surface after reading an approval screen. Shows that AP2's example screen omits the destination, so a
   careful user cannot catch a ship-to or gift-card-email redirect unless the screen is extended to show

@@ -251,3 +251,13 @@ def test_an_unexpected_fault_is_a_flat_500_and_is_not_remembered(api, world, mon
     assert "database" not in first.text  # no internals leak
     second = post(api, "/checkout_sessions", GOOD, key="retry")
     assert second.status_code == 201 and "Idempotent-Replayed" not in second.headers  # 5xx is never cached
+
+
+def test_acp_discovery_lists_transports_and_extensions(api):
+    from shipjack.mandates import FULFILLMENT
+    r = api.get("/.well-known/acp.json")  # discovery needs no auth
+    assert r.status_code == 200
+    d = r.json()
+    assert d["seller"]["id"] == "northwind" and set(d["transports"]) == {"rest", "mcp"}
+    assert ACP_API_VERSION in d["protocol"]["supported_versions"]
+    assert "ap2" in d["payment"]["handlers"] and FULFILLMENT in d["extensions"]

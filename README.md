@@ -2,32 +2,53 @@
 
 [![tests](https://github.com/Srivatsa03/shipjack/actions/workflows/tests.yml/badge.svg)](https://github.com/Srivatsa03/shipjack/actions/workflows/tests.yml)
 
-An agent-ready store, a shopping agent that pays through AP2 signed mandates, and an attack bench
-that checks how far a fooled shopping agent can go. It is named after the attack it found: a fooled
-agent pays the right store the right price, exactly once, and ships the order to someone else.
+**Make a merchant agent-ready for AI checkout.** shipjack is a reference integration that lets a
+store accept orders from AI shopping agents over the two new agentic-commerce protocols, with a real
+payment rail and the test suite that proves the integration is safe to ship.
 
-AI agents can now buy things. OpenAI and Stripe's Agentic Commerce Protocol (ACP) gives merchants a
-checkout API that agents call. Google's Agent Payments Protocol (AP2, v0.2 since April 2026) makes
-the user sign *mandates*: cryptographic limits on what the agent may buy, from whom, and for how
-much. AP2's security notes say plainly that prompt injection cannot be prevented, and that mandate
-constraints keep the worst case "strictly bounded".
+Merchants are starting to accept orders placed by AI agents, not people. Two protocols make that
+work: OpenAI and Stripe's **Agentic Commerce Protocol (ACP)** gives the store a checkout API the
+agent calls, and Google's **Agent Payments Protocol (AP2, v0.2)** makes the user cryptographically
+sign *mandates*: limits on what the agent may buy, from whom, and for how much. shipjack wires a
+merchant up to both.
 
-This project builds both sides and tests that claim:
+## What it integrates
 
-- **The store**: ACP checkout sessions over REST (versioning, bearer auth, idempotency keys), a
-  merchant-signed checkout for every approval, AP2 mandate verification and signed receipts.
-- **The agent's wallet**: the user signs open mandates once; a deterministic wallet closes them for
-  each purchase. The LLM never sees a key, a card or a mandate. It can only ask the wallet to pay.
-- **The bench**: three normal purchases and nine attacks, each hidden as ordinary business prose on a
-  product page or in a customer review, run against three ways of paying.
+- **An agent-ready store.** ACP checkout sessions (create, update, complete, cancel) over two
+  transports: a REST API (`API-Version`, bearer auth, `Idempotency-Key` replay and conflict rules,
+  flat errors, a `/.well-known/acp.json` discovery document) and an **MCP server** so any MCP agent
+  can shop there. One command runs it.
+- **AP2 payments.** A merchant-signed checkout for every approval, mandate verification, and signed
+  receipts, built on Google's [AP2 SDK](https://github.com/google-agentic-commerce/AP2) (pinned to
+  the v0.2 commit). Both modes: human-not-present (the user signs limits once, a deterministic wallet
+  buys inside them) and human-present (the user signs each purchase on a trusted surface).
+- **A real payment rail.** The processor settles through **Stripe test mode** (a confirmed
+  PaymentIntent per order), or a simulated processor when no Stripe key is set.
+- **A safety suite.** 330 tests that break one input at a time, so the integration can be shipped
+  with evidence, not hope. It is what surfaced the protocol gap below.
 
-The mandate cryptography is Google's [AP2 SDK](https://github.com/google-agentic-commerce/AP2)
-(pinned to the v0.2 commit). This project adds the merchant, the wallet, the payment side, the bench
-and one extension.
+## Run it
 
-## Result
+```bash
+pip install -e ".[dev,serve]"
+shipjack-serve                       # the store over HTTP; ACP discovery at /.well-known/acp.json
+# settle through Stripe test mode instead of the simulated processor:
+#   export STRIPE_TEST_KEY="$(security find-generic-password -a "$USER" -s stripe-test-key -w)"
+#   pip install -e ".[stripe]" && shipjack-serve --stripe
+shipjack-mcp                         # the same store as an MCP server over stdio
+```
 
-What gets through when the agent does exactly what the page says (`shipjack bench`, no model):
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for how a merchant adopts this.
+
+## Is it safe to ship? What the safety suite found
+
+The headline from building this: AP2 bounds what an agent **spends** but not **where the goods go**.
+That gap was found during the integration, reported to Google as
+[AP2 issue #381](https://github.com/google-agentic-commerce/AP2/issues/381), and closed here with a
+proposed constraint. The rest of this section is the evidence.
+
+What gets through when the agent does exactly what a (possibly poisoned) product page says
+(`shipjack bench`, no model):
 
 ```
                           Card (no protocol)    AP2 v0.2              AP2 + extensions

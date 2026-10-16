@@ -42,10 +42,10 @@ class World:
         return dict(self.merchants[store_id].info)
 
 
-def build(stores: list[Store]) -> World:
+def build(stores: list[Store], processor: Processor | None = None) -> World:
     surface = TrustedSurface()
     trust = TrustList([surface.verification_key()])
-    processor = Processor()
+    processor = processor if processor is not None else Processor()
     credentials = CredentialProvider(trust)
     processor.credentials = credentials
     merchants: dict[str, Merchant] = {}

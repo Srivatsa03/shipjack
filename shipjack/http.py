@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .mandates import FULFILLMENT
 from .merchant import ACP_API_VERSION, CheckoutError, Merchant
 
 SUPPORTED_VERSIONS = [ACP_API_VERSION]
@@ -105,6 +106,16 @@ def create_app(merchant: Merchant, tokens: dict[str, str]) -> FastAPI:
             headers["Request-Id"] = request.headers["request-id"]
         return JSONResponse(payload, status_code=code, headers=headers)
 
+    @app.get("/.well-known/acp.json")
+    def discovery() -> dict:
+        """ACP discovery: who the seller is, the API versions it speaks, and the transports it offers.
+
+        An agent reads this before its first call to choose REST or MCP and a compatible version.
+        """
+        return {"seller": dict(merchant.info), "protocol": {"supported_versions": SUPPORTED_VERSIONS},
+                "transports": ["rest", "mcp"], "payment": {"handlers": ["card", "ap2", "direct"]},
+                "extensions": [FULFILLMENT]}
+
     @app.get("/.well-known/ap2-merchant-key")
     def merchant_key() -> dict:
         return {"merchant": merchant.info, "jwk": json.loads(merchant.verification_key().export_public())}
@@ -154,3 +165,48 @@ def create_app(merchant: Merchant, tokens: dict[str, str]) -> FastAPI:
 
 class _NotAllowed(Exception):
     pass
+
+
+def demo_app(token: str = "demo-token", *, stripe: bool = False) -> FastAPI:
+    """A ready-to-run store (Northwind) with one demo platform token, for ``shipjack-serve``.
+
+    With ``stripe=True`` the money settles through Stripe test mode (needs STRIPE_TEST_KEY and the
+    'stripe' extra); otherwise the processor is simulated.
+    """
+    from .scenarios import stores
+    from .world import build
+    processor = None
+    if stripe:
+        from .stripe_psp import StripeProcessor
+        processor = StripeProcessor.from_env()
+    world = build(stores(), processor=processor)
+    app = create_app(world.merchants["northwind"], {token: "demo-agent-platform"})
+    app.state.world = world
+    return app
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the demo store over HTTP (the REST transport). Needs the optional 'serve' extra (uvicorn)."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="shipjack-serve", description="Run the demo agent-ready store over HTTP.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--token", default="demo-token", help="the bearer token an agent platform presents")
+    parser.add_argument("--stripe", action="store_true", help="settle through Stripe test mode (needs STRIPE_TEST_KEY)")
+    args = parser.parse_args(argv)
+    try:
+        import uvicorn
+    except ImportError:
+        import sys
+        print("shipjack-serve needs uvicorn: pip install 'shipjack[serve]'", file=sys.stderr)
+        return 2
+    try:
+        app = demo_app(args.token, stripe=args.stripe)
+    except ValueError as exc:
+        import sys
+        print(f"shipjack-serve: {exc}", file=sys.stderr)
+        return 2
+    rail = "Stripe test mode" if args.stripe else "simulated processor"
+    print(f"shipjack store on http://{args.host}:{args.port}  ({rail}; ACP discovery at /.well-known/acp.json)")
+    uvicorn.run(app, host=args.host, port=args.port)
+    return 0

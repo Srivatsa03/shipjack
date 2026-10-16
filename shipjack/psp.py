@@ -29,8 +29,9 @@ class Charge:
     account: str  # the merchant account the processor paid out to
     amount: int
     currency: str
-    method: str  # "card" or "ap2"
+    method: str  # "card", "ap2" or "direct"
     reference: str  # checkout session id, or the AP2 transaction_id (the checkout hash)
+    psp_ref: str = ""  # the payment-rail id (e.g. a Stripe PaymentIntent), when a real PSP settled it
 
 
 @dataclass
@@ -69,7 +70,8 @@ class Processor:
     def _charge_card(self, account: str, card_number: str, amount: int, currency: str, reference: str) -> Charge:
         if not self.credentials or card_number != self.credentials.card.number:
             raise PaymentError("payment_declined", "card number not recognised")
-        charge = Charge(account, amount, currency, "card", reference)
+        psp_ref = self._settle(amount, currency, reference, "card")
+        charge = Charge(account, amount, currency, "card", reference, psp_ref)
         self.charges.append(charge)
         return charge
 
@@ -95,10 +97,20 @@ class Processor:
             raise PaymentError("payment_declined", "token is bound to a different open checkout mandate")
         if self.binds_payee and self.registered.get(account) != scope.payee_id:
             raise PaymentError("payment_declined", f"token pays {scope.payee_id}, not account {account}")
-        scope.used = True
-        charge = Charge(account, amount, currency, "ap2", transaction_id)
+        psp_ref = self._settle(amount, currency, transaction_id, "ap2")
+        scope.used = True  # settle first; a PSP decline must not spend the token
+        charge = Charge(account, amount, currency, "ap2", transaction_id, psp_ref)
         self.charges.append(charge)
         return charge
+
+    def _settle(self, amount: int, currency: str, reference: str, method: str) -> str:
+        """Move the money on the payment rail. The base processor is simulated and settles instantly.
+
+        A real PSP (see shipjack/stripe_psp.py) overrides this to charge, and raises PaymentError on a
+        decline. It runs after every authorization check and before the charge is recorded, so a
+        decline leaves no charge and does not spend the token.
+        """
+        return ""
 
 
 @dataclass
