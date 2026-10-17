@@ -30,7 +30,9 @@ def test_the_load_tool_counts_purchases_storms_and_charges(server):
     url, db = server
     report = load.run(url, purchases=40, concurrency=4, clients=2, storms=3, storm_size=6, db=db)
     assert report["purchases"]["completed"] == 40 and report["purchases"]["errors"] == 0
-    assert report["storms"]["storms_with_one_paid_answer"] == 3 and report["storms"]["server_errors"] == 0
+    # more than one racer may answer "completed" (one that finds the charge on record finishes the order
+    # from it); the ledger, not the HTTP answers, says how many times each checkout was charged
+    assert report["storms"]["server_errors"] == 0 and report["storms"]["most_paid_answers_in_a_storm"] >= 1
     assert report["ledger"] == {"charges": 43, "orders": 43, "checkouts_charged_more_than_once": 0,
                                 "storm_sessions_charged_exactly_once": 3}
 
