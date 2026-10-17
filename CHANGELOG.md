@@ -14,6 +14,13 @@
   meaning on pgvector (vector, keyword or weighted hybrid), MCP `search_store_docs`, a retrieval eval
   (`shipjack retrieval-eval`, docs/RETRIEVAL.md). Orders keep the lines they were sold with.
 - **Postgres store backend** with the same guarantees as SQLite (advisory lock), tested in CI.
+- **Per-session locking and payments outside the transaction** (Postgres): a lock per checkout session
+  instead of one for the whole store, blocking work in a bounded thread pool, the payment call made
+  with no transaction open (mark the attempt, call the rail, record), reconciliation of attempts a
+  crash left half done, 409 `payment_in_progress` / `idempotency_key_in_use`, and an open-loop,
+  multi-server mode for `shipjack load` (`--rate`, `--duration`, `--psp-delay-ms` on the server).
+  Under a 300 ms payment API: 3 to about 60 purchases per second on three instances
+  (docs/LOAD_RESULTS.md).
 - **AP2 authority vectors for the fulfillment destination** (`shipjack ap2-vectors`,
   docs/AP2_FULFILLMENT_VECTORS.md): five cases in the two-record format of AP2 Discussion #332, run
   against the SDK at e1ea56d: a redirected ship-to and deliver-to (C4b), the same with the proposed
@@ -130,3 +137,9 @@ First version.
 - A trial in which the provider fails (an API error, as opposed to the model running out of steps) is
   discarded and run again on resume, for every profile, so a rate limit never counts as a result.
 - Built on Google's AP2 SDK (pinned to e1ea56d, AP2 v0.2) and the ACP spec at 2026-04-17.
+
+### Fixed
+
+- A session could be canceled while its payment was in flight; an order could record the catalog's
+  prices at the end of a payment instead of what was charged; a charge's ledger write could deadlock
+  with a refund on SQLite (all found while splitting the payment out of the transaction).

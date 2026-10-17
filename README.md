@@ -76,10 +76,12 @@ docker compose --profile app up --build          # http://localhost:3000, consol
   Order snapshot, HMAC `Merchant-Signature`), with retries and backoff, dead-lettering, per-order
   ordering, and a reference receiver that refuses forged, stale and replayed events.
 - **Durable, and safe with several processes.** With `--db`, the state, the ledger and the webhook
-  outbox live in one SQLite file: a `kill -9` loses nothing, and several server processes share the
-  store without charging, refunding or numbering anything twice. Charges and refunds carry Stripe
-  idempotency keys, so a retry after a crash pays once. Under load on one laptop: 40,000 purchases and
-  16,000 racing payment attempts, 0 errors, 0 double charges ([results](docs/LOAD_RESULTS.md)).
+  outbox live in SQLite or Postgres: a `kill -9` loses nothing, and several server processes share the
+  store without charging, refunding or numbering anything twice. On Postgres each checkout session has
+  its own lock, and the payment call runs with no transaction open; an attempt a crash left half done
+  is finished from the ledger (or by asking Stripe again with the same idempotency key). Under a 300 ms
+  payment API, three instances went from 3 to about 60 purchases per second, with 0 double charges
+  ([results](docs/LOAD_RESULTS.md)).
 - **A safety suite.** Over 1,000 test cases that break one input at a time, so the integration can be
   shipped with evidence, not hope. It is what surfaced the protocol gap below.
 

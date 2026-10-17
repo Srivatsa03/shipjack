@@ -36,17 +36,25 @@ def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _locked(method):
+def _locked_by(scope: str | None):
     """Run a public Merchant method as one transaction: one request changes a session at a time.
 
-    In memory that is the merchant's lock; in SQLite it is a write transaction that every server
-    process shares, and an error rolls the whole change back.
+    ``scope`` says what the method's first argument names, and so what it locks: "session" (a checkout
+    session id), "order" (an order id; an order shares its session's lock), "new" (it only creates rows),
+    or None (the whole store). In memory that is the merchant's one lock; in SQLite one writer at a
+    time; in Postgres a lock per session, so different shoppers' changes run in parallel. An error rolls
+    the whole change back.
     """
-    @functools.wraps(method)
-    def wrapper(self, *args, **kwargs):
-        with self.repo.transaction():
-            return method(self, *args, **kwargs)
-    return wrapper
+    def decorate(method):
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            with self.repo.transaction(keys=self._keys(scope, args[0] if args else None)):
+                return method(self, *args, **kwargs)
+        return wrapper
+    return decorate
+
+
+_locked = _locked_by(None)
 
 
 def _reading(method):
@@ -85,9 +93,12 @@ class Session:
     order: dict | None = None
     messages: list[dict] = field(default_factory=list)
     attempts: int = 0  # failed payment attempts; part of the payment rail's idempotency key
+    paying: dict | None = None  # the attempt now talking to the payment rail: its idempotency key and when
 
 
 class Merchant:
+    paying_timeout_s = 120.0  # an attempt marked this long with no charge on record died with its process
+
     def __init__(self, id: str, name: str, website: str, products: list[Product], processor: Processor,
                  trust: TrustList, *, supported: frozenset[str] = frozenset({FULFILLMENT}),
                  verifies_mandates: bool = True, impostor_of: dict | None = None, surcharge: int = 0,
@@ -154,6 +165,14 @@ class Merchant:
     def id(self) -> str:
         return self.info["id"]
 
+    def _keys(self, scope: str | None, ident) -> tuple[str, ...] | None:
+        """The lock keys for a change (see ``_locked_by``)."""
+        if scope is None:
+            return None
+        if scope == "new" or not isinstance(ident, str):
+            return ()
+        return (self.repo.order_key(ident) if scope == "order" else self.repo.session_key(ident),)
+
     def verification_key(self) -> JWK:
         return public(self.key)
 
@@ -170,7 +189,7 @@ class Merchant:
         return self.products[product_id].page()
 
     # ---- ACP checkout sessions -------------------------------------------------------------------
-    @_locked
+    @_locked_by("new")
     def create_session(self, items: list[dict], fulfillment_details: dict | None = None,
                        buyer: dict | None = None) -> dict:
         details, buyer = self._details(fulfillment_details), self._buyer(buyer)
@@ -180,7 +199,7 @@ class Merchant:
         self._log("session_created", session=session.id, items=[list(i) for i in cart])
         return self._render(self._refresh(session))
 
-    @_locked
+    @_locked_by("session")
     def update_session(self, session_id: str, items: list[dict] | None = None,
                        fulfillment_details: dict | None = None, buyer: dict | None = None) -> dict:
         session = self._open(session_id)
@@ -200,67 +219,186 @@ class Merchant:
     def get_session(self, session_id: str) -> dict:
         return self._render(self._session(session_id))
 
-    @_locked
+    @_locked_by("session")
     def cancel_session(self, session_id: str) -> dict:
         session = self._session(session_id)
         if session.status in ("completed", "canceled"):
             raise CheckoutError("invalid", f"session is already {session.status}")
+        if session.paying:  # the rail may be charging it right now
+            raise CheckoutError("payment_in_progress", "a payment for this session is in progress", "$.status")
         session.status, session.checkout_jwt, session.nonce = "canceled", None, None
         return self._render(session)
 
-    @_locked
-    def complete_session(self, session_id: str, payment_data: dict) -> dict:
-        session = self._open(session_id)
+    def complete_session(self, session_id: str, payment_data: dict, *, record=None) -> dict:
+        """Pay for a checkout session, in three steps so that no lock is held while the payment rail answers.
+
+        1. Locked: check that the session is payable and the mandate or approval holds, then mark the
+           attempt as paying, with its idempotency key. Another request for the session now gets
+           ``payment_in_progress`` instead of a second charge.
+        2. Unlocked: charge on the rail with that key. The processor's ledger records the charge.
+        3. Locked: record the order (or the decline) and clear the mark.
+
+        If the process dies between 1 and 3, the mark stays. The next request for the session, or
+        ``reconcile_payments``, finishes the order from the ledger (or the rail), so it is charged once.
+
+        ``record`` (the HTTP layer's idempotency record) rides in the same transactions: ``record.start()``
+        first, in step 1 (its answer, if any, ends the request there), and ``record.finish(out)`` in the
+        step that ends the request, so storing the answer costs no transaction of its own.
+        """
+        keys = (*self._keys("session", session_id), *(record.keys if record else ()))
+        with self.repo.transaction(keys=keys):
+            if record is not None:
+                early = record.start()
+                if early is not None:
+                    return early
+            started = self._start_payment(session_id, payment_data)
+            if "attempt" not in started:  # refused before any money moved, or finished from the ledger
+                return self._answer(record, started["out"])
+        attempt = started["attempt"]
+        try:
+            charge = self._charge(attempt)
+        except PaymentError as exc:
+            with self.repo.transaction(keys=keys):
+                return self._answer(record, self._declined(session_id, attempt["key"], exc))
+        with self.repo.transaction(keys=keys):
+            return self._answer(record, self._paid(session_id, attempt["key"], charge))
+
+    @staticmethod
+    def _answer(record, out: dict) -> dict:
+        if record is not None:
+            record.finish(out)
+        return out
+
+    def _start_payment(self, session_id: str, payment_data) -> dict:
+        session = self._open(session_id, allow_paying=True)
         if session.status != "ready_for_payment":
             raise CheckoutError("invalid", "session is not ready for payment", "$.status")
+        if session.paying:
+            out = self._finish_attempt(session, self.paying_timeout_s)
+            if out is not None:
+                return {"out": out}
+            if session.paying:
+                raise CheckoutError("payment_in_progress", "a payment for this session is in progress; "
+                                    "ask for the session again shortly", "$.status")
         if not isinstance(payment_data, dict):
             raise CheckoutError("invalid", "payment_data must be an object", "$.payment_data")
         handler = payment_data.get("handler_id")
         amount = self._total(session) + self.surcharge
         # the same attempt at the same amount gets the same key, so a retry after a crash cannot pay twice
         key = f"shipjack:{self.id}:{session.id}:{session.attempts}:{amount}"
+        attempt = {"key": key, "amount": amount, "session": session.id, "method": handler}
         try:
             if handler == "card":
                 instrument = payment_data.get("instrument")
                 credential = instrument.get("credential") if isinstance(instrument, dict) else None
                 number = credential.get("number") if isinstance(credential, dict) else None
-                charge = self.processor.charge_card(self.account, number if isinstance(number, str) else "", amount,
-                                                    "USD", session.id, idempotency_key=key)
-                receipt = None
+                attempt["number"] = number if isinstance(number, str) else ""  # kept in memory, never stored
             elif handler == "ap2":
-                charge, receipt = self._complete_ap2(session, payment_data, amount, key)
+                attempt.update(self._authorize_ap2(session, payment_data))
             elif handler == "direct":
-                charge, receipt = self._complete_direct(session, payment_data, amount, key)
+                attempt.update(self._authorize_direct(session, payment_data, amount))
             else:
                 raise CheckoutError("invalid", "unsupported payment handler", "$.payment_data.handler_id")
         except PaymentError as exc:
-            session.attempts += 1
-            session.messages = [{"type": "error", "code": "payment_declined", "content_type": "plain",
-                                 "content": str(exc)}]
-            out = self._render(session)
-            out["error"] = {"type": "processing_error", "code": exc.code, "message": str(exc)}
-            return out
+            return {"out": self._decline(session, exc)}
+        session.paying = {"key": key, "amount": amount, "method": handler, "since": time.time(),
+                          "transaction_id": attempt.get("transaction_id", session.id),
+                          "reference": attempt.get("reference", ""),
+                          # what is being bought, as priced now: the order records this, whatever the
+                          # catalog does while the rail answers
+                          "lines": [{"product_id": pid, "title": self.products[pid].title,
+                                     "unit_price": self.products[pid].price, "kind": self.products[pid].kind,
+                                     "quantity": qty} for pid, qty in session.items]}
+        return {"attempt": attempt}
+
+    def _charge(self, attempt: dict):
+        if attempt["method"] == "card":
+            return self.processor.charge_card(self.account, attempt["number"], attempt["amount"], "USD",
+                                              attempt["session"], idempotency_key=attempt["key"])
+        return self.processor.charge_token(self.account, attempt["token"], attempt["amount"], "USD",
+                                           attempt["transaction_id"], attempt.get("open_checkout_hash"),
+                                           method=attempt["method"], idempotency_key=attempt["key"])
+
+    def _declined(self, session_id: str, key: str, exc: PaymentError) -> dict:
+        session = self._session(session_id)
+        if not session.paying or session.paying["key"] != key:  # finished elsewhere in the meantime
+            return self._render(session)
+        session.paying = None
+        return self._decline(session, exc)
+
+    def _decline(self, session: Session, exc: PaymentError) -> dict:
+        session.attempts += 1  # the next attempt gets a new key, so a retry after a decline can succeed
+        session.messages = [{"type": "error", "code": "payment_declined", "content_type": "plain",
+                             "content": str(exc)}]
+        out = self._render(session)
+        out["error"] = {"type": "processing_error", "code": exc.code, "message": str(exc)}
+        return out
+
+    def _paid(self, session_id: str, key: str, charge) -> dict:
+        """Record the order for a charge that landed. Called with the session's lock held."""
+        session = self._session(session_id)
+        if not session.paying or session.paying["key"] != key:  # another request already recorded it
+            return self._render(session)
+        method = session.paying["method"]
+        receipt = (self._signed_receipt(session.paying.get("reference", ""), "Success", order_id=f"ord_{session.id}")
+                   if method in ("ap2", "direct") else None)
         order = {"id": f"ord_{session.id}", "checkout_session_id": session.id,
                  "permalink_url": f"{self.info['website']}/orders/{session.id}", "merchant": self.id,
                  "account": charge.account, "amount": charge.amount, "method": charge.method,
                  "payment_status": "paid", "refunded": 0, "status": "created", "created_at": _now(),
                  "items": list(session.items), "fulfillment_details": session.fulfillment.to_acp(),
-                 # what was bought, as it was sold then: a later catalog change must not rewrite the order
-                 "lines": [{"product_id": pid, "title": self.products[pid].title, "unit_price": self.products[pid].price,
-                            "kind": self.products[pid].kind, "quantity": qty} for pid, qty in session.items],
-                 "fulfillments": [], "adjustments": []}
-        self.repo.add_order(order, {"charge": charge, "checkout_jwt": session.checkout_jwt if handler != "card"
+                 # what was bought, as it was priced when the attempt began (not as the catalog is now)
+                 "lines": session.paying["lines"], "fulfillments": [], "adjustments": []}
+        self.repo.add_order(order, {"charge": charge, "checkout_jwt": session.checkout_jwt if method != "card"
                                     else None, "receipt": receipt,
                                     "mandate_reference": (receipt or {}).get("claims", {}).get("reference", "")})
         self._log("order_paid", order=order["id"], amount=charge.amount, method=charge.method, psp_ref=charge.psp_ref)
-        session.order, session.status, session.messages = order, "completed", []
+        session.order, session.status, session.messages, session.paying = order, "completed", [], None
         self._emit("order_create", order["id"])
         out = self._render(session)
         if receipt:
             out["ap2_receipt"] = receipt
         return out
 
-    @_locked
+    def _finish_attempt(self, session: Session, stale_after_s: float) -> dict | None:
+        """An attempt still marked as paying. If its charge is on record, record the order (returns the
+        completed session). If it is older than ``stale_after_s`` and the rail has nothing either, free
+        the session for a new attempt (returns None, ``paying`` cleared). Otherwise it is still running
+        (returns None, ``paying`` kept). Called with the session's lock held."""
+        paying = session.paying
+        charge = self.processor.find_charge(paying["key"])
+        if charge is None and time.time() - paying["since"] >= stale_after_s:
+            # a real rail may have charged before the process died: asking again with the same key
+            # returns that charge instead of making a second one (a simulated rail has nothing to say)
+            charge = self.processor.recover(self.account, paying["amount"], "USD", paying["transaction_id"],
+                                            paying["method"], paying["key"])
+            if charge is None:
+                session.paying = None
+                session.attempts += 1
+                session.messages = [{"type": "error", "code": "payment_declined", "content_type": "plain",
+                                     "content": "the last payment attempt did not complete; nothing was charged"}]
+                self._log("payment_attempt_freed", session=session.id, key=paying["key"])
+                return None
+        if charge is None:
+            return None
+        self._log("payment_attempt_finished", session=session.id, key=paying["key"])
+        return self._paid(session.id, paying["key"], charge)
+
+    def reconcile_payments(self, stale_after_s: float | None = None) -> dict:
+        """Finish or free payment attempts that a dead process left marked. Run it from a timer; every
+        server process may run it at once (each session is re-checked under its lock)."""
+        stale_after_s = self.paying_timeout_s if stale_after_s is None else stale_after_s
+        counts = {"finished": 0, "freed": 0, "running": 0}
+        for sid in self.repo.paying_sessions():
+            with self.repo.transaction(keys=self._keys("session", sid)):
+                session = self.repo.session(sid)
+                if session is None or not session.paying or session.status != "ready_for_payment":
+                    continue
+                out = self._finish_attempt(session, stale_after_s)
+                counts["finished" if out is not None else "freed" if session.paying is None else "running"] += 1
+        return counts
+
+    @_locked_by("order")
     def refund_order(self, order_id: str, amount: int | None = None) -> dict:
         """Return money for an order, in full or in part, on the same rail that charged it."""
         out = self._refund(order_id, amount)
@@ -281,7 +419,7 @@ class Merchant:
                 "psp_ref": refund.psp_ref}
 
     # ---- after the order: fulfillment ----------------------------------------------------------
-    @_locked
+    @_locked_by("order")
     def fulfill_order(self, order_id: str, *, carrier: str = "", tracking_number: str = "",
                       tracking_url: str = "") -> dict:
         """Hand the order over: physical lines ship (with tracking), digital lines are delivered by email."""
@@ -316,7 +454,7 @@ class Merchant:
         self._emit("order_update", order_id)
         return self.acp_order(order_id)
 
-    @_locked
+    @_locked_by("order")
     def mark_delivered(self, order_id: str) -> dict:
         """The carrier delivered every shipment: the order is complete."""
         _, order = self._order(order_id)
@@ -333,7 +471,7 @@ class Merchant:
         self._emit("order_update", order_id)
         return self.acp_order(order_id)
 
-    @_locked
+    @_locked_by("order")
     def cancel_order(self, order_id: str) -> dict:
         """Cancel a paid order before it ships, and return whatever has not been refunded yet."""
         _, order = self._order(order_id)
@@ -402,7 +540,7 @@ class Merchant:
                             for r in self.processor.refunds if r.charge_reference == charge.reference]}
 
     # ---- AP2 -------------------------------------------------------------------------------------
-    @_locked
+    @_locked_by("session")
     def ap2_checkout(self, session_id: str) -> dict:
         """Sign the current cart as a UCP Checkout JWT and issue a single-use nonce for its approval."""
         session = self._open(session_id)
@@ -414,7 +552,7 @@ class Merchant:
         self._log("checkout_signed", session=session.id, checkout_hash=digest(session.checkout_jwt))
         return {"checkout_jwt": session.checkout_jwt, "nonce": session.nonce, "aud": self.id}
 
-    def _complete_ap2(self, session: Session, payment_data: dict, amount: int, key: str):
+    def _authorize_ap2(self, session: Session, payment_data: dict) -> dict:
         if not session.checkout_jwt or not session.nonce:
             raise PaymentError("invalid_mandate", "no signed checkout to approve: call ap2_checkout first")
         text = lambda v: v if isinstance(v, str) else ""  # noqa: E731  (wrong types are treated as missing)
@@ -426,13 +564,11 @@ class Merchant:
             if violations:
                 self._receipt(mandate, "Error", error=violations[0].split(":")[0], detail="; ".join(violations))
                 raise PaymentError(error_code(violations), "; ".join(violations))
-        charge = self.processor.charge_token(self.account, text(payment_data.get("payment_token")), amount, "USD",
-                                             digest(session.checkout_jwt),
-                                             text(payment_data.get("open_checkout_hash")) or None,
-                                             idempotency_key=key)
-        return charge, self._receipt(mandate, "Success", order_id=f"ord_{session.id}")
+        return {"token": text(payment_data.get("payment_token")), "transaction_id": digest(session.checkout_jwt),
+                "open_checkout_hash": text(payment_data.get("open_checkout_hash")) or None,
+                "reference": _reference(mandate)}
 
-    def _complete_direct(self, session: Session, payment_data: dict, amount: int, key: str):
+    def _authorize_direct(self, session: Session, payment_data: dict, amount: int) -> dict:
         """Human-present: the user signed this exact checkout on their trusted surface."""
         from .direct import verify_user_approval
         if not session.checkout_jwt or not session.nonce:
@@ -445,16 +581,13 @@ class Merchant:
         if violations:
             self._receipt(approval, "Error", error=violations[0].split(":")[0], detail="; ".join(violations))
             raise PaymentError(error_code(violations), "; ".join(violations))
-        token = self.processor.credentials.authorize_direct(claims)
-        charge = self.processor.charge_token(self.account, token, amount, "USD", digest(session.checkout_jwt),
-                                             method="direct", idempotency_key=key)
-        return charge, self._receipt(approval, "Success", order_id=f"ord_{session.id}")
+        return {"token": self.processor.credentials.authorize_direct(claims),
+                "transaction_id": digest(session.checkout_jwt), "reference": _reference(approval)}
 
     def _receipt(self, mandate: str, status: str, **extra) -> dict:
-        try:
-            reference = digest(MandateClient().get_closed_mandate_jwt(mandate))
-        except Exception:
-            reference = ""
+        return self._signed_receipt(_reference(mandate), status, **extra)
+
+    def _signed_receipt(self, reference: str, status: str, **extra) -> dict:
         claims = {"iss": self.info["website"], "iat": int(time.time()), "status": status, "reference": reference}
         claims.update({k: v for k, v in extra.items() if v})
         receipt = {"jwt": create_jwt({"alg": "ES256", "typ": "JWT", "kid": self.key.get("kid")}, claims, self.key),
@@ -505,10 +638,12 @@ class Merchant:
             raise CheckoutError("not_found", f"no checkout session {session_id!r}")
         return session
 
-    def _open(self, session_id: str) -> Session:
+    def _open(self, session_id: str, allow_paying: bool = False) -> Session:
         session = self._session(session_id)
         if session.status in ("completed", "canceled"):
             raise CheckoutError("invalid", f"session is already {session.status}", "$.status")
+        if session.paying and not allow_paying:  # the cart, nonce and checkout must not change mid-payment
+            raise CheckoutError("payment_in_progress", "a payment for this session is in progress", "$.status")
         return session
 
     def _total(self, session: Session) -> int:
@@ -577,6 +712,14 @@ class Merchant:
                 "links": [{"type": "terms_of_service", "url": f"{self.info['website']}/terms"}],
                 "fulfillment_details": session.fulfillment.to_acp(),
                 "iat": int(time.time()), "jti": secrets.token_urlsafe(12)}
+
+
+def _reference(mandate: str) -> str:
+    """A receipt's reference: the hash of the closed mandate it answers ("" when there is none)."""
+    try:
+        return digest(MandateClient().get_closed_mandate_jwt(mandate))
+    except Exception:  # noqa: BLE001 - a malformed or direct approval has no closed mandate to hash
+        return ""
 
 
 def _acp_address(address: dict | None) -> dict | None:

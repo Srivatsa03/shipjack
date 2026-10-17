@@ -37,6 +37,7 @@ class Charge:
     psp_ref: str = ""  # the payment-rail id (e.g. a Stripe PaymentIntent), when a real PSP settled it
     refunded: int = 0  # how much of this charge has been refunded
     id: str = field(default_factory=lambda: "ch_" + secrets.token_hex(8))
+    idempotency_key: str = ""  # the payment attempt it settled; finds it again after a crash
 
 
 @dataclass
@@ -64,6 +65,7 @@ class _Scope:
     expires: float
     open_checkout_hash: str | None
     used: bool = False
+    in_flight: bool = False  # a charge holds it while the payment rail answers; nobody else may use it
 
 
 @dataclass
@@ -75,7 +77,11 @@ class Processor:
     registered: dict[str, str] = field(default_factory=dict)  # account -> merchant id it was onboarded as
     credentials: CredentialProvider | None = None
     binds_payee: bool = True  # pay out only if the token's payee is the account's onboarded identity
-    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)  # "unused" and "mark used" are one step
+    settle_delay_s: float = 0.0  # simulated payment-rail latency (a real PSP call takes 100s of ms)
+    # guards tokens and refunds. Never held during a charge's rail call or ledger write: a token is reserved
+    # under it, the rail is called and the ledger written without it (a database ledger takes its own
+    # lock, and taking it while holding this one could deadlock with a transaction that waits for this)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def refund(self, charge: Charge, amount: int | None = None) -> Refund:
         """Return money for a charge, in full or in part. A merchant cannot refund more than it took."""
@@ -94,22 +100,38 @@ class Processor:
             self.refunds.append(refund)
             return refund
 
+    def find_charge(self, idempotency_key: str) -> Charge | None:
+        """The charge a payment attempt made, by its idempotency key (None if it never landed)."""
+        find = getattr(self.charges, "find", None)
+        if find is not None:
+            return find(idempotency_key)
+        return next((c for c in list(self.charges) if c.idempotency_key == idempotency_key), None)
+
+    def recover(self, account: str, amount: int, currency: str, reference: str, method: str,
+                idempotency_key: str) -> Charge | None:
+        """After a crash: did the rail charge this attempt although nothing was recorded? A simulated rail
+        keeps no state outside the ledger, so no. A real PSP asks again with the same key (see
+        StripeProcessor), which returns the first charge, or makes the one the user approved, once."""
+        return None
+
     def _refund_rail(self, psp_ref: str, amount: int, currency: str, idempotency_key: str = "") -> str:
         """Return money on the payment rail. The base processor is simulated; a real PSP overrides this."""
         return ""
 
     def charge_card(self, account: str, card_number: str, amount: int, currency: str, reference: str,
                     idempotency_key: str = "") -> Charge:
-        """A raw card number authorizes any amount for anyone who holds it. That is the baseline."""
-        with self._lock:
-            return self._charge_card(account, card_number, amount, currency, reference, idempotency_key)
+        """A raw card number authorizes any amount for anyone who holds it. That is the baseline.
+
+        Nothing is locked while the rail answers: the caller (the merchant) holds the checkout, and two
+        charges for different checkouts have nothing to share."""
+        return self._charge_card(account, card_number, amount, currency, reference, idempotency_key)
 
     def _charge_card(self, account: str, card_number: str, amount: int, currency: str, reference: str,
                      idempotency_key: str = "") -> Charge:
         if not self.credentials or card_number != self.credentials.card.number:
             raise PaymentError("payment_declined", "card number not recognised")
         psp_ref = self._settle(amount, currency, reference, "card", idempotency_key)
-        charge = Charge(account, amount, currency, "card", reference, psp_ref)
+        charge = Charge(account, amount, currency, "card", reference, psp_ref, idempotency_key=idempotency_key)
         self.charges.append(charge)
         return charge
 
@@ -119,13 +141,28 @@ class Processor:
 
         ``method`` labels the charge: "ap2" for a mandate chain, "direct" for a user-signed approval.
         """
-        with self._lock:
-            return self._charge_token(account, token, amount, currency, transaction_id, open_checkout_hash, method,
-                                      idempotency_key)
+        return self._charge_token(account, token, amount, currency, transaction_id, open_checkout_hash, method,
+                                  idempotency_key)
 
     def _charge_token(self, account: str, token: str, amount: int, currency: str, transaction_id: str,
                       open_checkout_hash: str | None = None, method: str = "ap2",
                       idempotency_key: str = "") -> Charge:
+        with self._lock:  # checking the token and reserving it are one step
+            scope = self._reserve(account, token, amount, currency, transaction_id, open_checkout_hash)
+        try:
+            psp_ref = self._settle(amount, currency, transaction_id, method, idempotency_key)
+        except BaseException:
+            with self._lock:
+                scope.in_flight = False  # a decline (or a crash in the call) must not spend the token
+            raise
+        charge = Charge(account, amount, currency, method, transaction_id, psp_ref, idempotency_key=idempotency_key)
+        with self._lock:
+            scope.used, scope.in_flight = True, False
+        self.charges.append(charge)
+        return charge
+
+    def _reserve(self, account: str, token: str, amount: int, currency: str, transaction_id: str,
+                 open_checkout_hash: str | None) -> _Scope:
         scope = self.credentials.redeem(token) if self.credentials else None
         if scope is None:
             raise PaymentError("payment_declined", "unknown or already used payment token")
@@ -140,11 +177,8 @@ class Processor:
             raise PaymentError("payment_declined", "token is bound to a different open checkout mandate")
         if self.binds_payee and self.registered.get(account) != scope.payee_id:
             raise PaymentError("payment_declined", f"token pays {scope.payee_id}, not account {account}")
-        psp_ref = self._settle(amount, currency, transaction_id, method, idempotency_key)
-        scope.used = True  # settle first; a PSP decline must not spend the token
-        charge = Charge(account, amount, currency, method, transaction_id, psp_ref)
-        self.charges.append(charge)
-        return charge
+        scope.in_flight = True
+        return scope
 
     def _settle(self, amount: int, currency: str, reference: str, method: str, idempotency_key: str = "") -> str:
         """Move the money on the payment rail. The base processor is simulated and settles instantly.
@@ -154,6 +188,8 @@ class Processor:
         decline leaves no charge and does not spend the token. ``idempotency_key`` is the same for a
         retry of the same payment attempt, so a rail that honours it charges once.
         """
+        if self.settle_delay_s:
+            time.sleep(self.settle_delay_s)
         return ""
 
 
@@ -218,6 +254,6 @@ class CredentialProvider:
 
     def redeem(self, token: str) -> _Scope | None:
         scope = self._tokens.get(token)
-        if scope is None or scope.used:
+        if scope is None or scope.used or scope.in_flight:
             return None
         return scope

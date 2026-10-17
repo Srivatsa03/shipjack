@@ -4,11 +4,15 @@ Postgres), so the state survives a restart and several server processes can shar
 The merchant talks to a *repository*, and every change runs inside ``repo.transaction()``:
 
 * ``MemoryRepo`` is one re-entrant lock around plain dicts and lists (the original behaviour).
-* ``SqliteRepo`` turns the same transaction into one database transaction that admits one writer at a
-  time across every process: ``BEGIN IMMEDIATE`` on a SQLite file in WAL mode, or a transaction holding
-  a Postgres advisory lock. So "is this session still payable?" and "record the charge" are one step
-  even with several server processes racing for the same session. Objects read inside a transaction
-  are written back when it commits; if anything raises, nothing is written.
+* ``SqliteRepo`` turns the same transaction into one database transaction. SQLite admits one writer
+  at a time across every process (``BEGIN IMMEDIATE`` in WAL mode). Postgres locks only what a
+  transaction names: ``transaction(keys=...)`` takes the store-wide advisory lock in shared mode plus
+  an exclusive advisory lock per key (one checkout session, say), so changes to different sessions run
+  in parallel; ``keys=None`` (anything not yet split by key) takes the store-wide lock exclusively.
+  So "is this session still payable?" and "record the charge" are one step even with several server
+  processes racing for the same session. Objects read inside a transaction are written back when it
+  commits, but only if they changed, and a keyed transaction may change only what its keys cover; if
+  anything raises, nothing is written.
 
 ``open_database`` picks the backend: a ``postgresql://`` URL, or a SQLite file path.
 
@@ -78,8 +82,14 @@ class MemoryRepo:
         self._count = 0
         self._catalog: list[dict] | None = None
 
-    def transaction(self, write: bool = True):
-        return self._lock
+    def transaction(self, write: bool = True, keys: tuple[str, ...] | None = None):
+        return self._lock  # one lock for everything: keys narrow nothing in memory
+
+    def session_key(self, session_id: str) -> str:
+        return f"session:{session_id}"
+
+    def order_key(self, order_id: str) -> str:
+        return self.session_key(order_id.removeprefix("ord_"))
 
     def signing_key(self, name: str, make: Callable):
         return make()
@@ -93,6 +103,9 @@ class MemoryRepo:
 
     def add_session(self, session) -> None:
         self.sessions[session.id] = session
+
+    def paying_sessions(self) -> list[str]:
+        return [s.id for s in list(self.sessions.values()) if s.paying]
 
     def order(self, order_id: str) -> dict | None:
         return self._orders.get(order_id)
@@ -127,6 +140,9 @@ class MemoryRepo:
     def remember(self, slot: tuple, fingerprint: str, code: int, payload: Any) -> None:
         self._idempotency[slot] = (fingerprint, code, payload)
 
+    def forget(self, slot: tuple) -> None:
+        self._idempotency.pop(slot, None)
+
 
 # ---- in SQLite --------------------------------------------------------------------------------------
 
@@ -147,8 +163,16 @@ class _Database:
     def _connect(self):
         raise NotImplementedError
 
-    def _begin(self, conn, write: bool) -> None:
+    def _begin(self, conn, write: bool, keys: tuple[str, ...] | None) -> set[str] | None:
+        """Start a transaction and take its locks. Returns the keys now held, or None for "everything"."""
         raise NotImplementedError
+
+    def _lock_keys(self, conn, keys: list[str]) -> None:
+        """Take more key locks inside an open keyed transaction (a no-op where one lock covers all)."""
+
+    def held(self) -> set[str] | None:
+        """The keys the current write transaction holds, or None when it holds the whole store."""
+        return getattr(self._local, "held", None)
 
     def conn(self):
         conn = getattr(self._local, "conn", None)
@@ -180,18 +204,27 @@ class _Database:
             self._local.flush.append(flush)
 
     @contextmanager
-    def transaction(self, write: bool = True) -> Iterator[sqlite3.Connection]:
+    def transaction(self, write: bool = True, keys: tuple[str, ...] | None = None) -> Iterator[sqlite3.Connection]:
+        """``keys`` names what a write locks: a tuple of keys (possibly empty, for a change that only adds
+        new rows) runs alongside other keyed transactions; None locks the whole store. Nested, None
+        inherits the outer transaction's locks and a tuple adds its keys to them."""
         conn = self.conn()
         if self._local.depth:
             if write and not self._local.writing:  # upgrading a read to a write can fail under contention
                 raise RuntimeError("a write inside a read-only transaction; open the outer one with write=True")
+            held = self._local.held
+            if write and keys is not None and held is not None:
+                new = sorted(set(keys) - held)
+                if new:
+                    self._lock_keys(conn, new)
+                    held.update(new)
             self._local.depth += 1
             try:
                 yield conn
             finally:
                 self._local.depth -= 1
             return
-        self._begin(conn, write)
+        self._local.held = self._begin(conn, write, keys)
         self._local.depth, self._local.writing = 1, write
         try:
             yield conn
@@ -203,7 +236,7 @@ class _Database:
             raise
         finally:
             after, self._local.after = self._local.after, []
-            self._local.depth, self._local.flush, self._local.writing = 0, [], False
+            self._local.depth, self._local.flush, self._local.writing, self._local.held = 0, [], False, None
             for done in after:
                 done()
 
@@ -218,8 +251,8 @@ class _Database:
         with self.transaction(write=False) as conn:
             return conn.execute(sql, args).fetchall()
 
-    def write(self, sql: str, args: tuple = ()) -> sqlite3.Cursor:
-        with self.transaction() as conn:
+    def write(self, sql: str, args: tuple = (), keys: tuple[str, ...] | None = None) -> sqlite3.Cursor:
+        with self.transaction(keys=keys) as conn:
             return conn.execute(sql, args)
 
 
@@ -242,8 +275,9 @@ class Database(_Database):
         conn.execute("PRAGMA busy_timeout=60000")
         return conn
 
-    def _begin(self, conn, write: bool) -> None:
-        conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+    def _begin(self, conn, write: bool, keys: tuple[str, ...] | None) -> set[str] | None:
+        conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")  # SQLite's one writer lock covers every key
+        return None
 
 
 class _PgConnection:
@@ -295,15 +329,32 @@ class PostgresDatabase(_Database):
             conn.execute(f'SET search_path TO "{self.schema}", public')
         return _PgConnection(conn)
 
-    def _begin(self, conn, write: bool) -> None:
-        if write:
-            conn.execute("BEGIN")
-            conn.execute("SELECT pg_advisory_xact_lock(?)", (self.LOCK,))
-        else:
+    def _begin(self, conn, write: bool, keys: tuple[str, ...] | None) -> set[str] | None:
+        if not write:
             conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            return None
+        # BEGIN and every lock in one round trip: statements in one simple-protocol message run in order.
+        # Only integers go into this text (the lock ids are computed here, never taken from a request).
+        if keys is None:  # the whole store: waits for every keyed transaction, and they wait for it
+            conn.raw.execute(f"BEGIN; SELECT pg_advisory_xact_lock({int(self.LOCK)})")
+            return None
+        held = sorted(set(keys))  # one order for every transaction, so two never wait on each other
+        conn.raw.execute("; ".join(["BEGIN", f"SELECT pg_advisory_xact_lock_shared({int(self.LOCK)})",
+                                    *(f"SELECT pg_advisory_xact_lock({int(_key_id(k))})" for k in held)]))
+        return set(held)
+
+    def _lock_keys(self, conn, keys: list[str]) -> None:
+        for key in keys:
+            conn.execute("SELECT pg_advisory_xact_lock(?)", (_key_id(key),))
 
     def read(self, sql: str, args: tuple = ()) -> list[tuple]:
         return [tuple(r) for r in super().read(sql, args)]
+
+
+def _key_id(key: str) -> int:
+    """A 64-bit advisory lock id for a key (a collision only makes two keys share a lock)."""
+    import hashlib
+    return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), "big", signed=True)
 
 
 def open_database(target: str) -> _Database:
@@ -323,7 +374,7 @@ def _session_to_dict(s) -> dict:
             "fulfillment": {"name": f.name, "email": f.email, "phone": f.phone, "address": f.address,
                             "extra": f.extra},
             "checkout_jwt": s.checkout_jwt, "nonce": s.nonce, "order_id": s.order["id"] if s.order else None,
-            "messages": s.messages, "attempts": s.attempts}
+            "messages": s.messages, "attempts": s.attempts, "paying": s.paying}
 
 
 class SqliteRepo:
@@ -334,33 +385,57 @@ class SqliteRepo:
         self._local = threading.local()
 
     # an identity map per transaction: the same row read twice is the same object, and every object
-    # read inside a write transaction is written back when it commits
+    # read inside a write transaction is written back when it commits, if it changed
     def _map(self) -> dict | None:
         if not self.db.active or not self.db._local.writing:
             return None
         loaded = getattr(self._local, "loaded", None)
         if loaded is None:
             loaded = self._local.loaded = {}
+            self._local.seen = {}  # what each object looked like when it was read (None: new this transaction)
             self.db.on_commit(self._flush)
             self.db.after(self._forget)
         return loaded
 
     def _forget(self) -> None:
         self._local.loaded = None
+        self._local.seen = None
 
     def _flush(self) -> None:
-        conn = self.db.conn()
+        conn, held = self.db.conn(), self.db.held()
+        seen = self._local.seen or {}
         for (kind, key), obj in (self._local.loaded or {}).items():
             if kind == "session":
+                data = _dump(_session_to_dict(obj))
+                if data == seen.get((kind, key)):
+                    continue
+                self._check_held(held, self.session_key(key), seen.get((kind, key)))
                 conn.execute("INSERT INTO sessions (merchant, id, data) VALUES (?, ?, ?) ON CONFLICT (merchant, id) "
-                             "DO UPDATE SET data = excluded.data", (self.merchant, key, _dump(_session_to_dict(obj))))
+                             "DO UPDATE SET data = excluded.data", (self.merchant, key, data))
             elif kind == "order":
                 record = self._local.loaded[("record", key)]
+                data, rec = _dump(obj), _dump(_record_to_dict(record))
+                if (data, rec) == seen.get((kind, key)):
+                    continue
+                self._check_held(held, self.order_key(key), seen.get((kind, key)))
                 conn.execute("UPDATE orders SET data = ?, record = ? WHERE merchant = ? AND id = ?",
-                             (_dump(obj), _dump(_record_to_dict(record)), self.merchant, key))
+                             (data, rec, self.merchant, key))
 
-    def transaction(self, write: bool = True):
-        return self.db.transaction(write)
+    @staticmethod
+    def _check_held(held: set[str] | None, key: str, before) -> None:
+        """A keyed transaction writes back only rows it locked; a new row (``before`` None) is its own."""
+        if held is not None and before is not None and key not in held:
+            raise RuntimeError(f"changed {key} without holding its lock; name it in transaction(keys=...)")
+
+    def transaction(self, write: bool = True, keys: tuple[str, ...] | None = None):
+        return self.db.transaction(write, keys)
+
+    def session_key(self, session_id: str) -> str:
+        """The lock key for one checkout session and the order it becomes."""
+        return f"session:{self.merchant}:{session_id}"
+
+    def order_key(self, order_id: str) -> str:
+        return self.session_key(order_id.removeprefix("ord_"))
 
     def signing_key(self, name: str, make: Callable):
         from jwcrypto.jwk import JWK
@@ -387,6 +462,7 @@ class SqliteRepo:
         session = self._session_from_dict(json.loads(rows[0][0]))
         if loaded is not None:
             loaded[("session", session_id)] = session
+            self._local.seen[("session", session_id)] = _dump(_session_to_dict(session))
         return session
 
     def _session_from_dict(self, d: dict):
@@ -394,10 +470,17 @@ class SqliteRepo:
         from .merchant import Session
         return Session(d["id"], [tuple(i) for i in d["items"]], Fulfillment(**d["fulfillment"]), d["buyer"],
                        d["status"], d["checkout_jwt"], d["nonce"],
-                       self.order(d["order_id"]) if d["order_id"] else None, d["messages"], d["attempts"])
+                       self.order(d["order_id"]) if d["order_id"] else None, d["messages"], d["attempts"],
+                       d.get("paying"))
 
     def add_session(self, session) -> None:
         self._map()[("session", session.id)] = session
+
+    def paying_sessions(self) -> list[str]:
+        """Sessions with a payment attempt marked as talking to the rail (for reconciliation)."""
+        rows = self.db.read("SELECT id FROM sessions WHERE merchant = ? AND data LIKE ?",
+                            (self.merchant, '%"paying":{%'))
+        return [r[0] for r in rows]
 
     def order(self, order_id: str) -> dict | None:
         found = self._load_order(order_id)
@@ -417,6 +500,7 @@ class SqliteRepo:
         order, record = json.loads(rows[0][0]), _record_from_dict(json.loads(rows[0][1]))
         if loaded is not None:
             loaded[("order", order_id)], loaded[("record", order_id)] = order, record
+            self._local.seen[("order", order_id)] = (_dump(order), _dump(_record_to_dict(record)))
         return order, record
 
     def add_order(self, order: dict, record: dict) -> None:
@@ -424,6 +508,7 @@ class SqliteRepo:
                                (self.merchant, order["id"], _dump(order), _dump(_record_to_dict(record))))
         loaded = self._map()
         loaded[("order", order["id"])], loaded[("record", order["id"])] = order, record
+        self._local.seen[("order", order["id"])] = (_dump(order), _dump(_record_to_dict(record)))
 
     def add_receipt(self, receipt: dict) -> None:
         self.db.write("INSERT INTO receipts (merchant, data) VALUES (?, ?)", (self.merchant, _dump(receipt)))
@@ -456,6 +541,10 @@ class SqliteRepo:
                       "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (merchant, caller, path, key) DO UPDATE SET "
                       "fingerprint = excluded.fingerprint, code = excluded.code, payload = excluded.payload",
                       (self.merchant, *slot, fingerprint, code, _dump(payload)))
+
+    def forget(self, slot: tuple) -> None:
+        self.db.write("DELETE FROM idempotency WHERE merchant = ? AND caller = ? AND path = ? AND key = ?",
+                      (self.merchant, *slot))
 
     # read-only views, for tests and tools (each read is fresh from the database)
     @property
@@ -536,7 +625,18 @@ class LedgerCharges(Sequence):
         self.db = db
 
     def append(self, charge) -> None:
-        self.db.write("INSERT INTO ledger_charges (id, data) VALUES (?, ?)", (charge.id, _dump(asdict(charge))))
+        self.db.write("INSERT INTO ledger_charges (id, data) VALUES (?, ?)", (charge.id, _dump(asdict(charge))), keys=())
+
+    def find(self, idempotency_key: str):
+        """The charge a payment attempt made (a scan; used only to recover after a crash)."""
+        from .psp import Charge
+        if not idempotency_key:
+            return None
+        rows = self.db.read("SELECT data FROM ledger_charges WHERE data LIKE ?",
+                            ('%"idempotency_key":' + json.dumps(idempotency_key) + "%",))
+        # LIKE treats "_" as any one character: confirm the exact key
+        found = [d for d in (json.loads(r[0]) for r in rows) if d.get("idempotency_key") == idempotency_key]
+        return Charge(**found[0]) if found else None
 
     def _all(self) -> list:
         from .psp import Charge
@@ -559,7 +659,7 @@ class LedgerRefunds(Sequence):
         self.db = db
 
     def append(self, refund) -> None:
-        with self.db.transaction() as conn:
+        with self.db.transaction(keys=(f"charge:{refund.charge_id}",)) as conn:
             conn.execute("INSERT INTO ledger_refunds (data) VALUES (?)", (_dump(asdict(refund)),))
             row = conn.execute("SELECT data FROM ledger_charges WHERE id = ?", (refund.charge_id,)).fetchone()
             if row is not None:

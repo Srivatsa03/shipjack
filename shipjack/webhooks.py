@@ -196,7 +196,8 @@ class SqliteQueue:
 
     def finish(self, d: Delivery, outcome: str) -> None:
         self.db.write("UPDATE outbox SET state = ?, attempts = ?, next_at = ?, last_status = ?, last_error = ? "
-                      "WHERE id = ?", (d.state, d.attempts, d.next_at, d.last_status, d.last_error, d.id))
+                      "WHERE id = ?", (d.state, d.attempts, d.next_at, d.last_status, d.last_error, d.id),
+                      keys=(self.lease,))  # only the lease holder sends, so the lease key covers its rows
 
     def pending(self) -> list[Delivery]:
         return self._rows("state = 'pending'", ())
@@ -206,7 +207,7 @@ class SqliteQueue:
 
     def acquire(self, holder: str, now: float, ttl: float) -> bool:
         """Take or renew the sender lease. It is free when nobody holds it or the holder let it expire."""
-        with self.db.transaction() as conn:
+        with self.db.transaction(keys=(self.lease,)) as conn:
             row = conn.execute("SELECT holder, expires FROM leases WHERE name = ?", (self.lease,)).fetchone()
             if row is not None and row[0] != holder and row[1] >= now:
                 return False
@@ -217,7 +218,7 @@ class SqliteQueue:
 
     def release(self, holder: str) -> None:
         """Give the lease up now (a clean shutdown), so another process need not wait for it to expire."""
-        self.db.write("DELETE FROM leases WHERE name = ? AND holder = ?", (self.lease, holder))
+        self.db.write("DELETE FROM leases WHERE name = ? AND holder = ?", (self.lease, holder), keys=(self.lease,))
 
 
 @dataclass

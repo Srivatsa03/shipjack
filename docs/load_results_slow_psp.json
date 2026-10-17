@@ -1,0 +1,327 @@
+{
+ "date": "2026-10-17",
+ "machine": "Apple M1 laptop, 8 cores, 8 GB. Postgres 17 in a Colima VM (4 CPUs, 4 GB) on the same laptop, about 16 ms per round trip; 3 store processes and 4 load-client processes on the same laptop.",
+ "setup": "3 shipjack-serve instances (1 process each, SHIPJACK_THREADS=16) sharing one fresh Postgres database; simulated processor with a 300 ms settle delay (--psp-delay-ms 300); load: shipjack load --url <3 servers> --rate R --duration 30 --timeout 30 --clients 4 (open loop, latency from the scheduled start); storms: 50 x 20 agents paying one session, spread over the 3 servers.",
+ "versions": {
+  "before": "store-wide advisory lock for every write; the payment call inside the write transaction; blocking work on the async event loop; the processor's lock held during the rail call",
+  "per_session_locks": "per-session advisory locks (store lock shared), blocking work in a bounded thread pool, the processor's lock narrowed; the payment call still inside the session's transaction",
+  "payment_outside_transaction": "as per_session_locks, plus the three-step payment (mark the attempt, call the rail with no transaction open, record), the idempotency record merged into those transactions, BEGIN and locks in one round trip, and payment reconciliation"
+ },
+ "before": {
+  "storms": {
+   "storms": 50,
+   "agents_per_storm": 20,
+   "storms_with_one_paid_answer": 50,
+   "most_paid_answers_in_a_storm": 1,
+   "server_errors": 0
+  },
+  "storm_ledger": {
+   "charges": 50,
+   "orders": 50,
+   "checkouts_charged_more_than_once": 0,
+   "storm_sessions_charged_exactly_once": 50
+  },
+  "open_loop": {
+   "2": {
+    "attempted": 60,
+    "completed": 60,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 2.0,
+    "p50_ms": 994.4,
+    "p95_ms": 1363.2,
+    "p99_ms": 1549.7
+   },
+   "4": {
+    "attempted": 120,
+    "completed": 120,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 3.0,
+    "p50_ms": 1511.1,
+    "p95_ms": 21040.5,
+    "p99_ms": 22489.7
+   },
+   "8": {
+    "attempted": 240,
+    "completed": 178,
+    "errors": 62,
+    "error_kinds": [
+     "ReadTimeout"
+    ],
+    "per_second": 3.0,
+    "p50_ms": 10254.3,
+    "p95_ms": 30129.0,
+    "p99_ms": 30802.2
+   },
+   "16": {
+    "attempted": 480,
+    "completed": 178,
+    "errors": 302,
+    "error_kinds": [
+     "ConnectError",
+     "ReadTimeout"
+    ],
+    "per_second": 2.9,
+    "p50_ms": 10311.2,
+    "p95_ms": 31238.7,
+    "p99_ms": 37627.8
+   }
+  },
+  "final_ledger": {
+   "charges": 586,
+   "orders": 586,
+   "checkouts_charged_more_than_once": 0
+  }
+ },
+ "per_session_locks": {
+  "storms": {
+   "storms": 50,
+   "agents_per_storm": 20,
+   "storms_with_one_paid_answer": 50,
+   "most_paid_answers_in_a_storm": 1,
+   "server_errors": 0
+  },
+  "storm_ledger": {
+   "charges": 50,
+   "orders": 50,
+   "checkouts_charged_more_than_once": 0,
+   "storm_sessions_charged_exactly_once": 50
+  },
+  "open_loop": {
+   "4": {
+    "attempted": 120,
+    "completed": 120,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 4.1,
+    "p50_ms": 369.4,
+    "p95_ms": 399.7,
+    "p99_ms": 424.5
+   },
+   "8": {
+    "attempted": 240,
+    "completed": 240,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 8.0,
+    "p50_ms": 372.2,
+    "p95_ms": 407.7,
+    "p99_ms": 446.2
+   },
+   "16": {
+    "attempted": 480,
+    "completed": 480,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 15.9,
+    "p50_ms": 354.6,
+    "p95_ms": 377.8,
+    "p99_ms": 577.6
+   },
+   "32": {
+    "attempted": 960,
+    "completed": 960,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 31.7,
+    "p50_ms": 339.7,
+    "p95_ms": 507.3,
+    "p99_ms": 1171.2
+   },
+   "64": {
+    "attempted": 1920,
+    "completed": 1920,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 63.2,
+    "p50_ms": 354.6,
+    "p95_ms": 2906.8,
+    "p99_ms": 3370.1
+   },
+   "128": {
+    "attempted": 3840,
+    "completed": 3840,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 54.3,
+    "p50_ms": 15349.8,
+    "p95_ms": 39551.0,
+    "p99_ms": 40452.7
+   }
+  },
+  "final_ledger": {
+   "charges": 7610,
+   "orders": 7610,
+   "checkouts_charged_more_than_once": 0
+  }
+ },
+ "payment_outside_transaction": {
+  "storms": {
+   "storms": 50,
+   "agents_per_storm": 20,
+   "storms_with_one_paid_answer": 49,
+   "most_paid_answers_in_a_storm": 2,
+   "server_errors": 0
+  },
+  "storm_ledger": {
+   "charges": 50,
+   "orders": 50,
+   "checkouts_charged_more_than_once": 0,
+   "storm_sessions_charged_exactly_once": 50
+  },
+  "open_loop": {
+   "4": {
+    "attempted": 120,
+    "completed": 120,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 4.1,
+    "p50_ms": 362.0,
+    "p95_ms": 404.9,
+    "p99_ms": 461.3
+   },
+   "8": {
+    "attempted": 240,
+    "completed": 240,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 8.0,
+    "p50_ms": 360.4,
+    "p95_ms": 376.0,
+    "p99_ms": 385.2
+   },
+   "16": {
+    "attempted": 480,
+    "completed": 480,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 15.9,
+    "p50_ms": 352.6,
+    "p95_ms": 373.1,
+    "p99_ms": 558.5
+   },
+   "32": {
+    "attempted": 960,
+    "completed": 960,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 31.6,
+    "p50_ms": 350.8,
+    "p95_ms": 585.7,
+    "p99_ms": 886.9
+   },
+   "64": {
+    "attempted": 1920,
+    "completed": 1920,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 45.1,
+    "p50_ms": 9499.4,
+    "p95_ms": 18193.1,
+    "p99_ms": 18605.6
+   },
+   "128": {
+    "attempted": 3840,
+    "completed": 3749,
+    "errors": 91,
+    "error_kinds": [
+     "ReadTimeout"
+    ],
+    "per_second": 43.4,
+    "p50_ms": 29499.5,
+    "p95_ms": 55342.4,
+    "p99_ms": 56070.7
+   }
+  },
+  "final_ledger": {
+   "charges": 7574,
+   "orders": 7574,
+   "checkouts_charged_more_than_once": 0,
+   "note": "counted after the servers went idle; a count taken while timed-out requests were still finishing read 2 orders ahead of charges (two separate reads), so the ledger count now reads one snapshot"
+  }
+ },
+ "first_payment_outside_transaction_attempt": {
+  "note": "before merging the idempotency record into the payment transactions (about 29 round trips per purchase instead of about 16)",
+  "storms": {
+   "storms": 50,
+   "agents_per_storm": 20,
+   "storms_with_one_paid_answer": 50,
+   "most_paid_answers_in_a_storm": 1,
+   "server_errors": 0
+  },
+  "storm_ledger": {
+   "charges": 50,
+   "orders": 50,
+   "checkouts_charged_more_than_once": 0,
+   "storm_sessions_charged_exactly_once": 50
+  },
+  "open_loop": {
+   "4": {
+    "attempted": 120,
+    "completed": 120,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 4.1,
+    "p50_ms": 376.2,
+    "p95_ms": 407.4,
+    "p99_ms": 440.5
+   },
+   "8": {
+    "attempted": 240,
+    "completed": 240,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 8.0,
+    "p50_ms": 375.9,
+    "p95_ms": 402.0,
+    "p99_ms": 426.1
+   },
+   "16": {
+    "attempted": 480,
+    "completed": 480,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 15.8,
+    "p50_ms": 363.9,
+    "p95_ms": 413.5,
+    "p99_ms": 613.5
+   },
+   "32": {
+    "attempted": 960,
+    "completed": 960,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 31.6,
+    "p50_ms": 439.2,
+    "p95_ms": 7078.0,
+    "p99_ms": 8586.2
+   },
+   "64": {
+    "attempted": 1920,
+    "completed": 1920,
+    "errors": 0,
+    "error_kinds": [],
+    "per_second": 37.6,
+    "p50_ms": 11555.4,
+    "p95_ms": 27327.9,
+    "p99_ms": 28013.8
+   },
+   "128": {
+    "attempted": 3840,
+    "completed": 313,
+    "errors": 3527,
+    "error_kinds": [
+     "ReadTimeout"
+    ],
+    "per_second": 3.5,
+    "p50_ms": 29472.3,
+    "p95_ms": 57545.5,
+    "p99_ms": 58999.3
+   }
+  }
+ },
+ "saturation_at_48_threads": {
+  "note": "48 threads per process, 64 purchases/s offered: both versions collapse (14.7/s and 16.3/s, about 145 connections in open transactions at once), because Postgres in a 4-CPU VM and 7 Python processes saturate this 8-core laptop. A database limit of this machine, not a result about either design."
+ }
+}

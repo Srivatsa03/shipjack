@@ -69,6 +69,20 @@ class StripeProcessor(Processor):
         self.settlements.append({"id": intent.id, "amount": amount, "currency": currency, "reference": reference})
         return intent.id
 
+    def recover(self, account: str, amount: int, currency: str, reference: str, method: str,
+                idempotency_key: str):
+        """Nothing on record for a stale attempt: Stripe may still have charged before the process died.
+        The same request with the same idempotency key (kept 24 hours) returns that PaymentIntent, or
+        makes the one payment the user approved. Either way it is charged once."""
+        from .psp import Charge
+        try:
+            psp_ref = self._settle(amount, currency, reference, method, idempotency_key)
+        except PaymentError:
+            return None
+        charge = Charge(account, amount, currency, method, reference, psp_ref, idempotency_key=idempotency_key)
+        self.charges.append(charge)
+        return charge
+
     def _refund_rail(self, psp_ref: str, amount: int, currency: str, idempotency_key: str = "") -> str:
         if not psp_ref:
             return ""  # nothing settled on the rail (e.g. a simulated charge); nothing to refund there

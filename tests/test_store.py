@@ -97,7 +97,10 @@ def test_an_idempotent_replay_survives_a_restart(target):
 # ---- all or nothing ----------------------------------------------------------------------------------------
 
 
-def test_an_order_its_charge_and_its_webhook_commit_together_or_not_at_all(target):
+def test_an_order_and_its_webhook_commit_together_and_a_landed_charge_is_never_made_twice(target):
+    """The rail call runs outside the transaction, so once it returns the money has moved. A failure
+    while recording the order rolls back the order and its webhook together; the next attempt finds the
+    charge by its idempotency key and records the order from it, without charging again."""
     w, m = shop(target)
     box = Outbox("https://platform.example/hook", SECRET, send=lambda *a: 200).attach(m)
     sid = new_session(m)
@@ -108,16 +111,16 @@ def test_an_order_its_charge_and_its_webhook_commit_together_or_not_at_all(targe
     m.listeners.append(broken)
     with pytest.raises(RuntimeError):
         m.complete_session(sid, CARD)
-    assert not m.orders and not w.processor.charges and box.pending() == 0
-    assert m.get_session(sid)["status"] == "ready_for_payment"
+    assert not m.orders and box.pending() == 0 and len(w.processor.charges) == 1
+    assert m.sessions[sid].paying is not None  # the attempt is still marked
     m.listeners.remove(broken)
     assert m.complete_session(sid, CARD)["status"] == "completed"
-    assert len(w.processor.charges) == 1 and box.pending() == 1
+    assert len(w.processor.charges) == 1 and len(m.orders) == 1 and box.pending() == 1
 
 
 def test_a_crash_after_stripe_charged_does_not_charge_twice(target, monkeypatch):
-    """The rail charged, then the process died before it recorded the order. The retry sends the same
-    idempotency key, so Stripe returns the first PaymentIntent instead of charging again."""
+    """The rail charged and the ledger recorded it, then the process died before it recorded the order.
+    The retry finds the charge by its key and records the order; Stripe is not called again."""
     stripe = idempotent_stripe()
     monkeypatch.setitem(sys.modules, "stripe", stripe)
     world = build(stores(), processor=StripeProcessor(api_key="sk_test_x"), db=target)
@@ -136,8 +139,75 @@ def test_a_crash_after_stripe_charged_does_not_charge_twice(target, monkeypatch)
     assert not m.orders and m.get_session(sid)["status"] == "ready_for_payment"
     out = m.complete_session(sid, CARD)
     assert out["status"] == "completed"
-    assert len(stripe._calls["intents"]) == 1 and stripe._calls["keys"][0] == stripe._calls["keys"][1]
+    assert len(stripe._calls["intents"]) == 1 and len(stripe._calls["keys"]) == 1
     assert m.dispute_evidence(out["order"]["id"])["charge"]["psp_ref"] == "pi_fake_1"
+
+
+def test_a_crash_before_the_charge_was_recorded_asks_stripe_again_with_the_same_key(target, monkeypatch):
+    """Worst case: Stripe charged, then the process died before anything was recorded. Until the attempt
+    is stale a retry is told it is in progress; then reconciliation sends the same request with the
+    same idempotency key, Stripe answers with the first PaymentIntent, and the order is recorded once."""
+    stripe = idempotent_stripe()
+    monkeypatch.setitem(sys.modules, "stripe", stripe)
+    world = build(stores(), processor=StripeProcessor(api_key="sk_test_x"), db=target)
+    m = world.merchants["northwind"]
+    sid = new_session(m)
+    ledger, crashes = world.processor.charges, iter([True])
+
+    class DiesOnce:  # the ledger write is where the process dies
+        def append(self, charge):
+            if next(crashes, False):
+                raise RuntimeError("the process died here")
+            ledger.append(charge)
+
+        def __getattr__(self, name):
+            return getattr(ledger, name)
+
+    world.processor.charges = DiesOnce()
+    with pytest.raises(RuntimeError):
+        m.complete_session(sid, CARD)
+    with pytest.raises(CheckoutError) as busy:
+        m.complete_session(sid, CARD)
+    assert busy.value.code == "payment_in_progress" and len(stripe._calls["intents"]) == 1
+    assert m.reconcile_payments(stale_after_s=0) == {"finished": 1, "freed": 0, "running": 0}
+    assert m.get_session(sid)["status"] == "completed" and len(m.orders) == 1
+    assert len(stripe._calls["intents"]) == 1 and stripe._calls["keys"][0] == stripe._calls["keys"][1]
+
+
+def test_a_crash_before_the_rail_answered_frees_the_session_once_stale(target, monkeypatch):
+    w, m = shop(target)
+    sid = new_session(m)
+    real, crashes = w.processor._settle, iter([True])
+
+    def settle(*args, **kwargs):
+        if next(crashes, False):
+            raise RuntimeError("the process died here")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(w.processor, "_settle", settle)
+    with pytest.raises(RuntimeError):
+        m.complete_session(sid, CARD)
+    assert m.reconcile_payments() == {"finished": 0, "freed": 0, "running": 1}  # not stale yet
+    assert m.reconcile_payments(stale_after_s=0) == {"finished": 0, "freed": 1, "running": 0}
+    assert m.complete_session(sid, CARD)["status"] == "completed"
+    assert len(w.processor.charges) == 1 and m.sessions[sid].attempts == 1  # a new key for the new attempt
+
+
+def test_a_session_cannot_change_while_its_payment_is_in_flight(target):
+    w, m = shop(target)
+    w.processor.settle_delay_s = 0.6
+    sid = new_session(m)
+    paying = threading.Thread(target=m.complete_session, args=(sid, CARD))
+    paying.start()
+    time.sleep(0.25)
+    for change in (lambda: m.update_session(sid, items=[{"id": HUB.id, "quantity": 3}]),
+                   lambda: m.cancel_session(sid), lambda: m.ap2_checkout(sid),
+                   lambda: m.complete_session(sid, CARD)):
+        with pytest.raises(CheckoutError) as refused:
+            change()
+        assert refused.value.code == "payment_in_progress"
+    paying.join()
+    assert m.get_session(sid)["status"] == "completed" and len(w.processor.charges) == 1
 
 
 def test_a_crash_after_stripe_refunded_does_not_refund_twice(target, monkeypatch):
@@ -243,8 +313,10 @@ def test_processes_racing_to_pay_one_session_charge_it_once(target):
     w, m = shop(db)
     sid = new_session(m)
     results = race(_pay, (db, sid), 8)
-    assert sorted(results).count("completed") == 1, results
-    assert len(w.processor.charges) == 1 and len(m.orders) == 1
+    # one charge and one order, whoever records it: a racer that finds the charge already on record
+    # finishes the order from it and answers "completed" too; the rest are told it is paid or in progress
+    assert len(w.processor.charges) == 1 and len(m.orders) == 1, results
+    assert "completed" in results and set(results) <= {"completed", "invalid", "payment_in_progress"}, results
 
 
 def test_processes_racing_to_refund_one_order_refund_it_once(target):
@@ -307,3 +379,190 @@ def test_a_dead_senders_lease_expires_and_another_process_takes_over(target):
     clock.t += 31
     assert second.run_once() == 1 and sent == ["second"]
     assert json.loads(second.delivered[0].body)["type"] == "order_create"
+
+
+# ---- per-session locks (Postgres) ------------------------------------------------------------------------
+
+pg_only = pytest.mark.skipif(not PG, reason="set SHIPJACK_TEST_PG to a Postgres URL")
+
+
+@pytest.fixture
+def pg_db(request):
+    url, schema = pg_target()
+    request.getfixturevalue("pg_cleanup").append(schema)
+    return url
+
+
+def test_a_slow_payment_on_one_session_does_not_hold_up_another(target):
+    """The rail call runs outside the transaction, so even SQLite's single writer is free meanwhile."""
+    w, m = shop(target)
+    w.processor.settle_delay_s = 0.5  # like a real payment API
+    sids = [new_session(m) for _ in range(2)]
+    out = {}
+
+    def pay(sid):
+        out[sid] = m.complete_session(sid, CARD)["status"]
+
+    threads = [threading.Thread(target=pay, args=(s,)) for s in sids]
+    began = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.perf_counter() - began
+    assert sorted(out.values()) == ["completed", "completed"] and len(w.processor.charges) == 2
+    assert elapsed < 0.9, f"{elapsed:.2f} s: two different shoppers' payments waited for each other"
+
+
+@pg_only
+def test_a_keyed_change_cannot_rewrite_a_session_it_did_not_lock(pg_db):
+    _, m = shop(pg_db)
+    a, b = new_session(m), new_session(m)
+    with pytest.raises(RuntimeError, match="without holding its lock"), m.repo.transaction(keys=(m.repo.session_key(a),)):
+        m.repo.session(b).status = "canceled"
+    assert m.get_session(b)["status"] == "ready_for_payment"  # nothing was written
+
+
+@pg_only
+def test_a_store_wide_change_still_waits_for_keyed_ones(pg_db):
+    """replace_catalog (no keys) must not run while any keyed transaction is open."""
+    _, m = shop(pg_db)
+    sid = new_session(m)
+    inside = threading.Event()
+
+    def hold():
+        with m.repo.transaction(keys=(m.repo.session_key(sid),)):
+            inside.set()
+            time.sleep(0.6)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    inside.wait()
+    began = time.perf_counter()
+    m.replace_catalog(list(m.products.values()))
+    waited = time.perf_counter() - began
+    holder.join()
+    assert waited > 0.3, f"the catalog swap ran during a keyed transaction ({waited:.2f} s)"
+
+
+def test_a_catalog_change_during_a_payment_does_not_change_what_the_order_records(target):
+    """No lock is held while the rail answers, so the catalog may change then. The order records what
+    was priced and charged when the attempt began."""
+    from shipjack.catalog import Product
+    w, m = shop(target)
+    w.processor.settle_delay_s = 0.5
+    sid = new_session(m)
+    paying = threading.Thread(target=m.complete_session, args=(sid, CARD))
+    paying.start()
+    time.sleep(0.2)
+    m.replace_catalog([Product("nw-cable-2m", "Northwind USB-C Cable 2m", 1299)])  # the hub is gone
+    paying.join()
+    order = m.orders[0]
+    assert order["amount"] == 3499 and order["lines"][0]["unit_price"] == 3499
+    assert order["lines"][0]["product_id"] == HUB.id and len(w.processor.charges) == 1
+
+
+def test_charges_and_refunds_at_once_never_wait_on_each_other_forever(target):
+    """A charge writes the ledger outside any transaction while a refund runs inside one. If the
+    processor held its own lock during that ledger write, the two would wait on each other (SQLite has
+    one writer). Everything must finish, each charge and refund exactly once."""
+    w, m = shop(target)
+    paid = [m.complete_session(new_session(m), CARD)["order"]["id"] for _ in range(6)]
+    fresh = [new_session(m) for _ in range(6)]
+    errors = []
+
+    def run(fn, *args):
+        try:
+            fn(*args)
+        except Exception as exc:  # noqa: BLE001 - collected and asserted below
+            errors.append(repr(exc))
+
+    threads = ([threading.Thread(target=run, args=(m.complete_session, sid, CARD)) for sid in fresh]
+               + [threading.Thread(target=run, args=(m.refund_order, oid)) for oid in paid])
+    began = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "deadlocked"
+    assert not errors and time.perf_counter() - began < 20, errors
+    assert len(w.processor.charges) == 12 and len(w.processor.refunds) == 6
+
+
+def test_over_http_a_second_request_waits_its_turn_and_the_charge_happens_once(target):
+    w, m = shop(target)
+    w.processor.settle_delay_s = 0.6
+    client = TestClient(create_app(m, {"t": "platform"}))
+    head = {"Authorization": "Bearer t", "API-Version": ACP_API_VERSION}
+    sid = client.post("/checkout_sessions", json={"items": [{"id": HUB.id}], "fulfillment_details": {"address": HOME}},
+                      headers={**head, "Idempotency-Key": "c1"}).json()["id"]
+    path = f"/checkout_sessions/{sid}/complete"
+    first = {}
+    paying = threading.Thread(target=lambda: first.setdefault(
+        "r", client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k1"})))
+    paying.start()
+    time.sleep(0.25)
+    same_key = client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k1"})
+    other_key = client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k2"})
+    paying.join()
+    assert same_key.status_code == 409 and same_key.json()["code"] == "idempotency_key_in_use"
+    assert other_key.status_code == 409 and other_key.json()["code"] == "payment_in_progress"
+    assert first["r"].status_code == 200 and first["r"].json()["status"] == "completed"
+    replay = client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k1"})
+    assert replay.headers.get("Idempotent-Replayed") == "true" and replay.json() == first["r"].json()
+    assert len(w.processor.charges) == 1
+
+
+def test_the_processor_never_holds_its_lock_while_writing_the_ledger(target):
+    """The deterministic form of the deadlock above: whenever a charge is written to the ledger (a
+    database write, with its own lock), another thread must be able to take the processor's lock."""
+    w, m = shop(target)
+    ledger, held = w.processor.charges, []
+
+    class Probe:
+        def append(self, charge):
+            got = []
+
+            def try_lock():
+                ok = w.processor._lock.acquire(timeout=0.5)
+                got.append(ok)
+                if ok:
+                    w.processor._lock.release()
+
+            other = threading.Thread(target=try_lock)
+            other.start()
+            other.join()
+            held.append(not got[0])
+            ledger.append(charge)
+
+        def __getattr__(self, name):
+            return getattr(ledger, name)
+
+        def __len__(self):
+            return len(ledger)
+
+    w.processor.charges = Probe()
+    m.complete_session(new_session(m), CARD)
+    assert held == [False], "the processor lock was held during the ledger write"
+
+
+def test_no_transaction_is_open_while_the_payment_rail_answers(target):
+    """The point of the three-step payment: whether called directly or over HTTP, the thread that calls
+    the payment rail holds no database transaction (and so no lock) while it waits for the answer."""
+    w, m = shop(target)
+    inside, real = [], w.processor._settle
+
+    def settle(*args, **kwargs):
+        inside.append(m.repo.db.active)
+        return real(*args, **kwargs)
+
+    w.processor._settle = settle
+    m.complete_session(new_session(m), CARD)
+    client = TestClient(create_app(m, {"t": "platform"}))
+    head = {"Authorization": "Bearer t", "API-Version": ACP_API_VERSION}
+    sid = client.post("/checkout_sessions", json={"items": [{"id": HUB.id}], "fulfillment_details": {"address": HOME}},
+                      headers={**head, "Idempotency-Key": "c"}).json()["id"]
+    paid = client.post(f"/checkout_sessions/{sid}/complete", json={"payment_data": CARD},
+                       headers={**head, "Idempotency-Key": "p"})
+    assert paid.json()["status"] == "completed"
+    assert inside == [False, False], "a transaction was open during the rail call"
