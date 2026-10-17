@@ -2,6 +2,11 @@
 
 [![tests](https://github.com/Srivatsa03/shipjack/actions/workflows/tests.yml/badge.svg)](https://github.com/Srivatsa03/shipjack/actions/workflows/tests.yml)
 
+**Try it live: [shipjack.vercel.app](https://shipjack.vercel.app).** Every visitor gets a private
+sandbox: ask the shopping assistant for a product, approve the test purchase, then ship the order from
+the store console and watch the chat update. Payments are simulated. The first visit after a quiet
+period can take up to a minute while the free server wakes.
+
 **Make a merchant agent-ready for AI checkout.** shipjack is a reference integration that lets a
 store accept orders from AI shopping agents over the two new agentic-commerce protocols, with a real
 payment rail and the test suite that proves the integration is safe to ship.
