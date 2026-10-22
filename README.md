@@ -284,9 +284,16 @@ tools beyond the binding (`search_products`, `get_product`, `get_ap2_checkout`) 
 products and fetch a signed checkout. Run it with `shipjack-mcp`. A purchase over MCP reaches the same
 place as over the in-process API, so the delivery finding does not depend on the transport.
 
+What happens when a tool call's response is lost and the agent retries, for
+[MCP issue #3394](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/3394): 16 runnable
+cases against the store's MCP endpoint, including a server process killed right after the payment API
+charged, each with the ledger's count, what the client saw and what it can conclude
+(`shipjack mcp-retry-vectors`, [docs/MCP_RETRY_VECTORS.md](docs/MCP_RETRY_VECTORS.md)). No case charges
+twice; running them found six things to fix, all fixed.
+
 ## How it is tested
 
-1,054 test cases, run in CI on Python 3.11 and 3.12 with a Postgres service. They break one input at a
+1,099 test cases, run in CI on Python 3.11 and 3.12 with a Postgres service. They break one input at a
 time, so a refusal always points at one named check. Every test that builds a store runs on each
 store: in memory, a SQLite file, and Postgres. The assistant's tests use scripted models and the real
 store in process, so they need no network and no keys.

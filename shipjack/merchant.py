@@ -21,6 +21,7 @@ from ap2.sdk.jwt_helper import create_jwt
 from ap2.sdk.mandate import MandateClient
 from jwcrypto.jwk import JWK
 
+from . import idempotency
 from .catalog import Fulfillment, Product
 from .keys import new_key, public
 from .mandates import FULFILLMENT, TrustList, digest, error_code, verify_checkout
@@ -241,9 +242,11 @@ class Merchant:
         If the process dies between 1 and 3, the mark stays. The next request for the session, or
         ``reconcile_payments``, finishes the order from the ledger (or the rail), so it is charged once.
 
-        ``record`` (the HTTP layer's idempotency record) rides in the same transactions: ``record.start()``
-        first, in step 1 (its answer, if any, ends the request there), and ``record.finish(out)`` in the
-        step that ends the request, so storing the answer costs no transaction of its own.
+        ``record`` (the request's ``idempotency.Key``) rides in the same transactions: ``record.start()``
+        first, in step 1 (its answer, if any, ends the request there). The mark keeps the key's
+        reference, and whoever finishes the attempt (step 3 here, a retry with another key, or
+        ``reconcile_payments``) stores the answer under the key, so storing it costs no transaction of
+        its own and a crash between the steps does not lose it.
         """
         keys = (*self._keys("session", session_id), *(record.keys if record else ()))
         with self.repo.transaction(keys=keys):
@@ -251,7 +254,7 @@ class Merchant:
                 early = record.start()
                 if early is not None:
                     return early
-            started = self._start_payment(session_id, payment_data)
+            started = self._start_payment(session_id, payment_data, reply=record.ref() if record else None)
             if "attempt" not in started:  # refused before any money moved, or finished from the ledger
                 return self._answer(record, started["out"])
         attempt = started["attempt"]
@@ -259,9 +262,9 @@ class Merchant:
             charge = self._charge(attempt)
         except PaymentError as exc:
             with self.repo.transaction(keys=keys):
-                return self._answer(record, self._declined(session_id, attempt["key"], exc))
+                return self._declined(session_id, attempt["key"], exc)
         with self.repo.transaction(keys=keys):
-            return self._answer(record, self._paid(session_id, attempt["key"], charge))
+            return self._paid(session_id, attempt["key"], charge)
 
     @staticmethod
     def _answer(record, out: dict) -> dict:
@@ -269,7 +272,7 @@ class Merchant:
             record.finish(out)
         return out
 
-    def _start_payment(self, session_id: str, payment_data) -> dict:
+    def _start_payment(self, session_id: str, payment_data, reply: dict | None = None) -> dict:
         session = self._open(session_id, allow_paying=True)
         if session.status != "ready_for_payment":
             raise CheckoutError("invalid", "session is not ready for payment", "$.status")
@@ -309,6 +312,8 @@ class Merchant:
                           "lines": [{"product_id": pid, "title": self.products[pid].title,
                                      "unit_price": self.products[pid].price, "kind": self.products[pid].kind,
                                      "quantity": qty} for pid, qty in session.items]}
+        if reply:
+            session.paying["reply"] = reply  # who to answer when the attempt is finished, by whoever
         return {"attempt": attempt}
 
     def _charge(self, attempt: dict):
@@ -323,8 +328,10 @@ class Merchant:
         session = self._session(session_id)
         if not session.paying or session.paying["key"] != key:  # finished elsewhere in the meantime
             return self._render(session)
-        session.paying = None
-        return self._decline(session, exc)
+        paying, session.paying = session.paying, None
+        out = self._decline(session, exc)
+        idempotency.answer(self.repo, paying.get("reply"), out)
+        return out
 
     def _decline(self, session: Session, exc: PaymentError) -> dict:
         session.attempts += 1  # the next attempt gets a new key, so a retry after a decline can succeed
@@ -339,7 +346,8 @@ class Merchant:
         session = self._session(session_id)
         if not session.paying or session.paying["key"] != key:  # another request already recorded it
             return self._render(session)
-        method = session.paying["method"]
+        paying = session.paying
+        method = paying["method"]
         receipt = (self._signed_receipt(session.paying.get("reference", ""), "Success", order_id=f"ord_{session.id}")
                    if method in ("ap2", "direct") else None)
         order = {"id": f"ord_{session.id}", "checkout_session_id": session.id,
@@ -358,6 +366,7 @@ class Merchant:
         out = self._render(session)
         if receipt:
             out["ap2_receipt"] = receipt
+        idempotency.answer(self.repo, paying.get("reply"), out)  # the request that marked it may be gone
         return out
 
     def _finish_attempt(self, session: Session, stale_after_s: float) -> dict | None:
@@ -378,6 +387,7 @@ class Merchant:
                 session.messages = [{"type": "error", "code": "payment_declined", "content_type": "plain",
                                      "content": "the last payment attempt did not complete; nothing was charged"}]
                 self._log("payment_attempt_freed", session=session.id, key=paying["key"])
+                idempotency.answer(self.repo, paying.get("reply"), None)  # its key is free: a retry runs
                 return None
         if charge is None:
             return None
@@ -687,7 +697,9 @@ class Merchant:
         """The authoritative ACP cart state."""
         lines = self._line_items(session)
         total = sum(li["total"] for li in lines)
-        return {"id": session.id, "status": session.status, "currency": "usd",
+        # while the rail answers, the session is not payable and not yet paid (ACP's complete_in_progress)
+        status = "complete_in_progress" if session.paying and session.status == "ready_for_payment" else session.status
+        return {"id": session.id, "status": status, "currency": "usd",
                 "merchant": dict(self.claimed), "line_items": lines,
                 "fulfillment_details": session.fulfillment.to_acp(),
                 "totals": [{"type": "subtotal", "display_text": "Subtotal", "amount": total},

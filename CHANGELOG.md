@@ -17,7 +17,7 @@
 - **Per-session locking and payments outside the transaction** (Postgres): a lock per checkout session
   instead of one for the whole store, blocking work in a bounded thread pool, the payment call made
   with no transaction open (mark the attempt, call the rail, record), reconciliation of attempts a
-  crash left half done, 409 `payment_in_progress` / `idempotency_key_in_use`, and an open-loop,
+  crash left half done, 409 `payment_in_progress` / `idempotency_in_flight`, and an open-loop,
   multi-server mode for `shipjack load` (`--rate`, `--duration`, `--psp-delay-ms` on the server).
   Under a 300 ms payment API: 3 to about 60 purchases per second on three instances
   (docs/LOAD_RESULTS.md).
@@ -26,6 +26,15 @@
   against the SDK at e1ea56d: a redirected ship-to and deliver-to (C4b), the same with the proposed
   fulfillment constraint, and a destination changed after the closed mandate was signed (C1, #358).
 - **MCP over Streamable HTTP** at the store's `POST /mcp`.
+- **MCP lost-response retry vectors** (`shipjack mcp-retry-vectors`, docs/MCP_RETRY_VECTORS.md): 16 cases
+  for MCP issue #3394 (a response lost after the effect, then a retry with the same key, a new key or
+  none; duplicates in flight; a restart; a server process killed after or before the charge; three
+  processes at once), each with the ledger's count, the client's view and its conclusion.
+- **One idempotency path for REST and MCP** (`shipjack/idempotency.py`): keys in the store's database,
+  claimed under their own lock with the change; the payment mark carries the client's key, so whoever
+  finishes a payment after a crash answers it. Sessions show `complete_in_progress` while the rail
+  answers. A same-key retry in flight gets 409 `idempotency_in_flight` with `Retry-After`
+  (ACP 2026-04-17).
 - **Deployment**: a public demo mode (sandboxes, caps, no shared tokens), Dockerfiles, docker compose
   for the whole stack, a Render blueprint, docs/DEPLOY.md.
 
@@ -140,6 +149,11 @@ First version.
 
 ### Fixed
 
+- MCP idempotency keys lived in each server process's memory and were checked without a claim: 8
+  identical creates at once made 8 sessions, three processes made three, and a restart forgot every key.
+  The request digest included `meta`, so a retry with a new `request_id` was refused as a conflict. A
+  read-back during a payment said `ready_for_payment`. The REST API stored `payment_in_progress` as a
+  key's answer. The MCP endpoint ran its work on the event loop. (Found by the MCP retry vectors.)
 - A session could be canceled while its payment was in flight; an order could record the catalog's
   prices at the end of a payment instead of what was charged; a charge's ledger write could deadlock
   with a refund on SQLite (all found while splitting the payment out of the transaction).

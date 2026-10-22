@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Any
 
+from .idempotency import RETRY_AFTER_S, Conflict, InFlight, Key, Replay, fingerprint
 from .merchant import ACP_API_VERSION, CheckoutError, Merchant
 
 PROTOCOL_VERSION = "2025-11-25"
@@ -71,6 +71,8 @@ ACP_TOOLS = [
                                                                        "kind": {"type": "string"}}}}, ["meta"]),
 ]
 TOOL_NAMES = {t["name"] for t in ACP_TOOLS}
+MUTATING = ("create_checkout_session", "update_checkout_session", "complete_checkout_session",
+            "cancel_checkout_session")
 
 
 class ToolError(Exception):
@@ -82,19 +84,22 @@ class ToolError(Exception):
 
 
 class MCPStore:
-    """One merchant behind the MCP binding. One connection is one authenticated caller.
+    """One merchant behind the MCP binding, for one authenticated caller.
 
-    Idempotency keys are scoped to this instance (the connection) and the tool path, as the REST API
-    scopes them to the caller and path.
+    Idempotency keys (``meta.idempotency_key``) work as on the REST API: scoped to the caller and the
+    tool, kept in the store's database (so a retry finds them after a restart or on another server
+    process), claimed in the same transaction as the change, compared by the call's arguments without
+    ``meta`` (a retry may carry a new ``request_id``). The binding makes the key optional; without one a
+    retried create makes a second session, while a retried complete still cannot pay a session twice.
     """
 
     def __init__(self, merchant: Merchant, *, api_version: str = ACP_API_VERSION,
-                 server_name: str = "shipjack-store", kb=None):
+                 server_name: str = "shipjack-store", kb=None, caller: str = "mcp"):
         self.merchant = merchant
         self.kb = kb  # the store's knowledge base (hybrid search), when it has one
         self.api_version = api_version
         self.server_name = server_name
-        self._seen: dict[tuple[str, str], dict] = {}
+        self.caller = caller
 
     # ---- discovery -------------------------------------------------------------------------------
     def discovery(self) -> dict:
@@ -118,23 +123,63 @@ class MCPStore:
                              "message": f"api_version {meta['api_version']} is not supported",
                              "supported_versions": [self.api_version]})
         key = meta.get("idempotency_key")
-        mutating = name in ("create_checkout_session", "update_checkout_session", "complete_checkout_session",
-                            "cancel_checkout_session")
-        if key is not None and mutating:
-            slot = (name, str(key))
-            fingerprint = json.dumps(_canonical(arguments), separators=(",", ":"))
-            if slot in self._seen:
-                stored_fp, stored = self._seen[slot]
-                if stored_fp != fingerprint:
-                    raise ToolError({"type": "invalid_request", "code": "idempotency_conflict",
-                                     "message": "idempotency_key already used with a different request"})
-                return stored
-        result = self._dispatch(name, arguments, meta)
-        if key is not None and mutating:
-            self._seen[(name, str(key))] = (json.dumps(_canonical(arguments), separators=(",", ":")), result)
-        return result
+        if key is None or name not in MUTATING:
+            return self._dispatch(name, arguments, meta)
+        idem = Key(self.merchant.repo, self.merchant.id, (self.caller, f"mcp:{name}", str(key)),
+                   fingerprint({k: v for k, v in arguments.items() if k != "meta"}))
+        try:
+            out = self._idempotent(name, arguments, meta, idem)
+        except Conflict:
+            raise ToolError({"type": "invalid_request", "code": "idempotency_conflict",
+                             "message": "idempotency_key already used with a different request"}) from None
+        except InFlight:
+            raise ToolError({"type": "invalid_request", "code": "idempotency_in_flight",
+                             "message": "a request with this idempotency_key is currently being processed",
+                             "retry_after": RETRY_AFTER_S}) from None
+        if isinstance(out, Replay):
+            if out.code >= 400:
+                raise ToolError(out.payload)
+            return out.payload
+        return out
 
-    def _dispatch(self, name: str, arguments: dict, meta: dict) -> dict:
+    def _idempotent(self, name: str, arguments: dict, meta: dict, idem: Key):
+        """Run a mutating call under its key: the claim, the change and the answer in one transaction,
+        except complete, which runs its own (no lock while the rail answers) and takes the key along."""
+        repo = self.merchant.repo
+        if name == "complete_checkout_session":
+            try:
+                return self._dispatch(name, arguments, meta, record=idem)
+            except ToolError as exc:  # refused in its first transaction, which rolled back
+                if exc.body.get("code") != "payment_in_progress":  # "still running" is not an answer
+                    with repo.transaction(keys=idem.keys):
+                        idem.finish(exc.body, 400)
+                raise
+            except (Conflict, InFlight):  # the key belongs to another request: leave it alone
+                raise
+            except BaseException:
+                with repo.transaction(keys=idem.keys):
+                    idem.forget()  # a fault is never remembered: a retry runs again
+                raise
+        sid = arguments.get("id")
+        locks = (*((repo.session_key(sid),) if isinstance(sid, str) else ()), *idem.keys)
+        failed = None
+        with repo.transaction(keys=locks):
+            early = idem.start(claim=False)
+            if early is not None:
+                return early
+            try:
+                out = self._dispatch(name, arguments, meta)
+            except ToolError as exc:
+                out, failed = None, exc
+            if failed is None:
+                idem.finish(out)
+            elif failed.body.get("code") != "payment_in_progress":  # "still running" is not an answer
+                idem.finish(failed.body, 400)
+        if failed is not None:
+            raise failed
+        return out
+
+    def _dispatch(self, name: str, arguments: dict, meta: dict, record: Key | None = None):
         m = self.merchant
         sid = arguments.get("id")
         payload = arguments.get("payload") or {}
@@ -154,7 +199,7 @@ class MCPStore:
                                         fulfillment_details=payload.get("fulfillment_details"),
                                         buyer=payload.get("buyer"))
             if name == "complete_checkout_session":
-                return m.complete_session(sid, payload.get("payment_data"))
+                return m.complete_session(sid, payload.get("payment_data"), record=record)
             if name == "cancel_checkout_session":
                 return m.cancel_session(sid)
             if name == "search_products":
@@ -216,16 +261,6 @@ class MCPStore:
             if reply is not None:
                 stdout.write(json.dumps(reply) + "\n")
                 stdout.flush()
-
-
-def _canonical(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: _canonical(v) for k, v in sorted(value.items())}
-    if isinstance(value, list):
-        return [_canonical(v) for v in value]
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return value
 
 
 def _rpc_ok(mid, result) -> dict:

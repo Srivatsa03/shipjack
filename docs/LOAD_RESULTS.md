@@ -31,7 +31,8 @@ What changed:
 - **The payment call outside any transaction**, in three steps: mark the attempt (with its idempotency
   key and the lines and amount being charged), call the rail with no transaction open, then record the
   order or the decline. Another request for the session meanwhile gets 409 `payment_in_progress`; a
-  second request with the same `Idempotency-Key` gets 409 `idempotency_key_in_use`. The HTTP layer's
+  second request with the same `Idempotency-Key` gets 409 `idempotency_in_flight` (with `Retry-After`;
+  `idempotency_key_in_use` until October 21 2026). The HTTP layer's
   idempotency record rides in the first and last of those transactions.
 - **Reconciliation.** If a process dies between the steps, the attempt stays marked. The next request
   for the session, or a timer in every server process (`SHIPJACK_RECONCILE_EVERY_S`), finds the charge

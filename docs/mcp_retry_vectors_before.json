@@ -1,0 +1,595 @@
+{
+ "what": "lost-response retry vectors for shipjack's MCP checkout tools (MCP issue #3394)",
+ "transport": "MCP Streamable HTTP (JSON answers), protocol 2025-11-25; ACP MCP binding, API 2026-04-17",
+ "store": "shipjack 0.1.0.dev0, SQLite (WAL), simulated payment processor",
+ "fault": "in-process: the client drops the answer after the server committed; K: the server process ends itself with os._exit and a new one starts on the same database",
+ "all_as_expected": false,
+ "vectors": [
+  {
+   "id": "L1",
+   "matrix": "B02, R01; ryjen B",
+   "title": "complete: response lost, retry with the same key",
+   "effects": {
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "complete",
+     "rpc_id": 2,
+     "lost": "timeout"
+    },
+    {
+     "call": "complete (retry)",
+     "rpc_id": 3,
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    },
+    {
+     "call": "get_checkout_session",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    }
+   ],
+   "reported": {
+    "from_answer": "succeeded",
+    "after_read_back": "succeeded"
+   },
+   "expected": {
+    "charges": 1,
+    "from_answer": "succeeded",
+    "after_read_back": "succeeded"
+   },
+   "as_expected": true,
+   "note": ""
+  },
+  {
+   "id": "L2",
+   "matrix": "ryjen A (fresh key)",
+   "title": "complete: response lost, retry with a new key",
+   "effects": {
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "complete",
+     "rpc_id": 2,
+     "lost": "timeout"
+    },
+    {
+     "call": "complete (retry)",
+     "rpc_id": 3,
+     "error": "invalid"
+    },
+    {
+     "call": "get_checkout_session",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    }
+   ],
+   "reported": {
+    "from_answer": "failed",
+    "after_read_back": "succeeded"
+   },
+   "expected": {
+    "charges": 1,
+    "from_answer": "failed",
+    "after_read_back": "succeeded"
+   },
+   "as_expected": true,
+   "note": "the session id is a server-issued operation identity: the retry is refused, not run again; only a read-back shows it succeeded"
+  },
+  {
+   "id": "L3",
+   "matrix": "ryjen E (no key)",
+   "title": "complete: response lost, retry with no key",
+   "effects": {
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "complete",
+     "rpc_id": 2,
+     "lost": "timeout"
+    },
+    {
+     "call": "complete (retry)",
+     "rpc_id": 3,
+     "error": "invalid"
+    },
+    {
+     "call": "get_checkout_session",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    }
+   ],
+   "reported": {
+    "from_answer": "failed",
+    "after_read_back": "succeeded"
+   },
+   "expected": {
+    "charges": 1,
+    "from_answer": "failed",
+    "after_read_back": "succeeded"
+   },
+   "as_expected": true,
+   "note": "as L2: no second charge, but the answer alone says failed"
+  },
+  {
+   "id": "L4",
+   "matrix": "B01 shape, ryjen A",
+   "title": "create: response lost, retry with no key",
+   "effects": {
+    "sessions": 2
+   },
+   "observed": [
+    {
+     "call": "create",
+     "lost": "timeout"
+    },
+    {
+     "call": "create (again)",
+     "status": "ready_for_payment",
+     "session": "cs_northwind_2"
+    }
+   ],
+   "reported": {
+    "from_answer": "a session id"
+   },
+   "expected": {
+    "sessions": 2
+   },
+   "as_expected": true,
+   "note": "no money moves at create; an extra session is left open"
+  },
+  {
+   "id": "L5",
+   "matrix": "B02, ryjen B",
+   "title": "create: response lost, retry with the same key",
+   "effects": {
+    "sessions": 1
+   },
+   "observed": [
+    {
+     "call": "create",
+     "lost": "timeout"
+    },
+    {
+     "call": "create (again)",
+     "status": "ready_for_payment",
+     "session": "cs_northwind_1"
+    }
+   ],
+   "reported": {
+    "from_answer": "a session id"
+   },
+   "expected": {
+    "sessions": 1
+   },
+   "as_expected": true,
+   "note": ""
+  },
+  {
+   "id": "L6",
+   "matrix": "ryjen D, T04",
+   "title": "create: the same cart again on purpose, with a new key",
+   "effects": {
+    "sessions": 2
+   },
+   "observed": [
+    {
+     "call": "create",
+     "status": "ready_for_payment",
+     "session": "cs_northwind_1"
+    },
+    {
+     "call": "create (again)",
+     "status": "ready_for_payment",
+     "session": "cs_northwind_2"
+    }
+   ],
+   "reported": {
+    "from_answer": "a session id"
+   },
+   "expected": {
+    "sessions": 2
+   },
+   "as_expected": true,
+   "note": ""
+  },
+  {
+   "id": "L7",
+   "matrix": "harness requirement 2",
+   "title": "same key, a new meta.request_id on the retry",
+   "effects": {
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "complete",
+     "lost": "timeout"
+    },
+    {
+     "call": "complete (retry)",
+     "error": "idempotency_conflict"
+    }
+   ],
+   "reported": {
+    "from_answer": "failed"
+   },
+   "expected": {
+    "charges": 1,
+    "from_answer": "succeeded"
+   },
+   "as_expected": false,
+   "note": "the request digest leaves meta out, as REST leaves headers out"
+  },
+  {
+   "id": "L8",
+   "matrix": "A06",
+   "title": "same key, different arguments (another session)",
+   "effects": {
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "complete",
+     "lost": "timeout"
+    },
+    {
+     "call": "complete (other session, same key)",
+     "error": "idempotency_conflict"
+    }
+   ],
+   "reported": {
+    "from_answer": "idempotency_conflict"
+   },
+   "expected": {
+    "charges": 1,
+    "from_answer": "idempotency_conflict"
+   },
+   "as_expected": true,
+   "note": "refused before anything runs; nothing from the first call is returned"
+  },
+  {
+   "id": "L9",
+   "matrix": "A05",
+   "title": "another caller sends the same key for its own session",
+   "effects": {
+    "charges_a": 1,
+    "charges_b": 1,
+    "a_receipt_leaked_to_b": false
+   },
+   "observed": [
+    {
+     "caller": "A",
+     "call": "complete",
+     "lost": "timeout"
+    },
+    {
+     "caller": "B",
+     "call": "complete",
+     "status": "completed",
+     "session": "cs_northwind_2",
+     "order": "ord_cs_northwind_2"
+    }
+   ],
+   "reported": {
+    "from_answer_b": "succeeded"
+   },
+   "expected": {
+    "charges_a": 1,
+    "charges_b": 1,
+    "a_receipt_leaked_to_b": false,
+    "from_answer_b": "succeeded"
+   },
+   "as_expected": true,
+   "note": "keys are scoped to the authenticated caller and the tool"
+  },
+  {
+   "id": "L10",
+   "matrix": "X02, ryjen C",
+   "title": "the rail is still answering when the client asks again",
+   "effects": {
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "complete",
+     "lost": "timeout"
+    },
+    {
+     "call": "complete (same key, in flight)",
+     "error": "payment_in_progress"
+    },
+    {
+     "call": "complete (new key, in flight)",
+     "error": "payment_in_progress"
+    },
+    {
+     "call": "get_checkout_session (in flight)",
+     "status": "ready_for_payment",
+     "session": "cs_northwind_1"
+    },
+    {
+     "call": "complete (same key, after)",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    }
+   ],
+   "reported": {
+    "from_answer_in_flight": "unknown",
+    "read_back_in_flight": "not paid",
+    "from_answer_after": "succeeded"
+   },
+   "expected": {
+    "charges": 1,
+    "from_answer_in_flight": "unknown",
+    "read_back_in_flight": "unknown",
+    "from_answer_after": "succeeded"
+   },
+   "as_expected": false,
+   "note": "the read-back says complete_in_progress (ACP 2026-04-17), so a missing order is not read as not paid"
+  },
+  {
+   "id": "L11",
+   "matrix": "X01, C01",
+   "title": "8 identical creates, then 8 identical completes, delivered at once",
+   "effects": {
+    "sessions": 8,
+    "distinct_session_ids": 8,
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "complete x8 (answers)",
+     "payment_in_progress": 7,
+     "completed": 1
+    },
+    {
+     "call": "complete (same key, after)",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    }
+   ],
+   "reported": {
+    "from_answer_after": "succeeded"
+   },
+   "expected": {
+    "sessions": 1,
+    "distinct_session_ids": 1,
+    "charges": 1,
+    "from_answer_after": "succeeded"
+   },
+   "as_expected": false,
+   "note": "one runs; the others wait on the key's lock and get its answer, or are told it is in flight"
+  },
+  {
+   "id": "L12",
+   "matrix": "durable recovery",
+   "title": "answers lost, server restarted before each retry",
+   "effects": {
+    "sessions": 2,
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "create",
+     "lost": "timeout"
+    },
+    {
+     "call": "create (retry, new process)",
+     "status": "ready_for_payment",
+     "session": "cs_northwind_2"
+    },
+    {
+     "call": "complete",
+     "lost": "timeout"
+    },
+    {
+     "call": "complete (retry, new process)",
+     "error": "invalid"
+    }
+   ],
+   "reported": {
+    "from_answer": "failed"
+   },
+   "expected": {
+    "sessions": 1,
+    "charges": 1,
+    "from_answer": "succeeded"
+   },
+   "as_expected": false,
+   "note": "keys live in the store's database, not in the server process"
+  },
+  {
+   "id": "L13",
+   "matrix": "stored failure",
+   "title": "a decline is an answer too",
+   "effects": {
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "complete (bad card)",
+     "lost": "timeout"
+    },
+    {
+     "call": "complete (retry, same key)",
+     "status": "ready_for_payment",
+     "session": "cs_northwind_1",
+     "declined": "payment_declined"
+    },
+    {
+     "call": "complete (good card, new key)",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    }
+   ],
+   "reported": {
+    "from_answer_retry": "failed",
+    "from_answer_good": "succeeded"
+   },
+   "expected": {
+    "charges": 1,
+    "from_answer_retry": "failed",
+    "from_answer_good": "succeeded"
+   },
+   "as_expected": true,
+   "note": "the decline is stored with the key once execution started; a new key is a new attempt"
+  },
+  {
+   "id": "K1",
+   "matrix": "R03",
+   "title": "the process dies after the rail charged, before the order",
+   "effects": {
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "complete",
+     "lost": "connection dropped",
+     "server_exit_code": 137
+    },
+    {
+     "call": "complete (same key, new process, at once)",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    },
+    {
+     "call": "get_checkout_session (at once)",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    },
+    {
+     "call": "complete (same key, once settled)",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    },
+    {
+     "call": "get_checkout_session (after)",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    }
+   ],
+   "reported": {
+    "at_once": "succeeded",
+    "read_back_at_once": "succeeded",
+    "once_settled": "succeeded",
+    "after_read_back": "succeeded"
+   },
+   "expected": {
+    "charges": 1,
+    "at_once": [
+     "unknown",
+     "succeeded"
+    ],
+    "read_back_at_once": [
+     "unknown",
+     "succeeded"
+    ],
+    "once_settled": "succeeded",
+    "after_read_back": "succeeded"
+   },
+   "as_expected": true,
+   "note": "reconciliation finds the charge in the ledger by the payment's key and records the order; the answer is stored under the client's key, so its retry gets the receipt"
+  },
+  {
+   "id": "K2",
+   "matrix": "R02, then authoritative non-execution",
+   "title": "the process dies after marking the attempt, before the rail call",
+   "effects": {
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "complete",
+     "lost": "connection dropped",
+     "server_exit_code": 137
+    },
+    {
+     "call": "complete (same key, new process, at once)",
+     "error": "payment_in_progress"
+    },
+    {
+     "call": "get_checkout_session (at once)",
+     "status": "ready_for_payment",
+     "session": "cs_northwind_1"
+    },
+    {
+     "call": "complete (same key, once settled)",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    },
+    {
+     "call": "get_checkout_session (after)",
+     "status": "completed",
+     "session": "cs_northwind_1",
+     "order": "ord_cs_northwind_1"
+    }
+   ],
+   "reported": {
+    "at_once": "unknown",
+    "read_back_at_once": "not paid",
+    "once_settled": "succeeded",
+    "after_read_back": "succeeded"
+   },
+   "expected": {
+    "charges": 1,
+    "at_once": [
+     "unknown",
+     "succeeded"
+    ],
+    "read_back_at_once": [
+     "unknown",
+     "succeeded"
+    ],
+    "once_settled": "succeeded",
+    "after_read_back": "succeeded"
+   },
+   "as_expected": false,
+   "note": "no charge carries the payment's key; once the attempt is stale (1.5 s here, 120 s by default) reconciliation frees the session and the client's key, and the retry pays once. With Stripe it would first resend the same payment key"
+  },
+  {
+   "id": "K3",
+   "matrix": "C01, X01 across processes",
+   "title": "9 identical creates, then 9 identical completes, spread over 3 server processes on one database",
+   "effects": {
+    "distinct_session_ids": 3,
+    "charges": 1
+   },
+   "observed": [
+    {
+     "call": "complete x9 (answers)",
+     "payment_in_progress": 6,
+     "completed": 3
+    },
+    {
+     "call": "complete (same key, after)",
+     "error": "invalid"
+    }
+   ],
+   "reported": {
+    "from_answer_after": "failed"
+   },
+   "expected": {
+    "distinct_session_ids": 1,
+    "charges": 1,
+    "from_answer_after": "succeeded"
+   },
+   "as_expected": false,
+   "note": "one runs; while it is out, the others are told it is in flight"
+  }
+ ]
+}

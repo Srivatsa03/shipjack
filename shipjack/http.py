@@ -18,24 +18,23 @@ an agent platform's token gets 403 there.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
 import threading
-import time
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from .idempotency import RETRY_AFTER_S, Conflict, InFlight, Key, Replay
+from .idempotency import fingerprint as _fingerprint
 from .mandates import FULFILLMENT
 from .merchant import ACP_API_VERSION, CheckoutError, Merchant
 from .psp import PaymentError
 
 SUPPORTED_VERSIONS = [ACP_API_VERSION]
-CLAIM_TTL_S = 300.0  # a claimed Idempotency-Key whose request died is free again after this
 
 log = logging.getLogger("shipjack.http")
 
@@ -44,21 +43,6 @@ def _error(status: int, code: str, message: str, param: str | None = None, type_
            **extra: Any) -> JSONResponse:
     body = {"type": type_, "code": code, "message": message, **({"param": param} if param else {}), **extra}
     return JSONResponse(body, status_code=status)
-
-
-def _canonical(value: Any) -> Any:
-    """ACP request equivalence: key order and trailing zeros do not matter; null and absent differ."""
-    if isinstance(value, dict):
-        return {k: _canonical(v) for k, v in sorted(value.items())}
-    if isinstance(value, list):
-        return [_canonical(v) for v in value]
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return value
-
-
-def _fingerprint(body: Any) -> str:
-    return hashlib.sha256(json.dumps(_canonical(body), separators=(",", ":")).encode()).hexdigest()
 
 
 def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[str, str] | None = None,
@@ -86,9 +70,9 @@ def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[st
 
         ``atomic`` (the default): the replay check, the action and remembering its answer are one
         transaction. An action that runs its own transactions (complete: it must not hold a lock while
-        the payment rail answers) is not atomic: it gets the request's idempotency record and claims the
-        key in its first transaction and stores the answer in its last. A second request with that key
-        meanwhile gets 409 ``idempotency_key_in_use``, as Stripe answers."""
+        the payment rail answers) is not atomic: it gets the request's ``idempotency.Key``, claims it in
+        its first transaction and leaves its answer to whoever finishes the payment. A second request
+        with that key meanwhile gets 409 ``idempotency_in_flight`` with ``Retry-After`` (ACP 2026-04-17)."""
         auth = request.headers.get("authorization", "")
         presented = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else None
         caller = None
@@ -130,79 +114,58 @@ def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[st
             return _error(400, "idempotency_key_required", "Idempotency-Key header is required on all POST requests")
         if len(key) > 255:
             return _error(400, "invalid", "Idempotency-Key is longer than 255 characters")
-        slot = (caller, request.url.path, key)
-        # the slot's own lock: two requests with one key wait for each other, whatever else they lock
-        locks = None if keys is None else (*keys, f"idem:{merchant.id}:" + hashlib.sha256(
-            json.dumps(slot).encode()).hexdigest())
+        idem = Key(merchant.repo, merchant.id, (caller, request.url.path, key), _fingerprint(body), status)
+        locks = None if keys is None else (*keys, *idem.keys)
 
         def act():
             # the replay check, the action and remembering its response are one transaction, so two
             # server processes that get the same key at the same moment cannot both act on it
             with merchant.repo.transaction(keys=locks):
-                seen = merchant.repo.idempotent(slot)
-                if seen is not None:
-                    fingerprint, code, payload = seen
-                    if fingerprint != _fingerprint(body):
-                        return _error(422, "idempotency_conflict",
-                                      "Idempotency-Key has already been used with a different request body")
-                    return JSONResponse(payload, status_code=code,
-                                        headers={"Idempotent-Replayed": "true", "Idempotency-Key": key})
+                early = idem.start(claim=False)
+                if early is not None:
+                    return early
                 try:
                     code, payload = status, action(body)
                 except (CheckoutError, _NotAllowed) as exc:
                     code, payload = _failure(request, exc)
-                merchant.repo.remember(slot, _fingerprint(body), code, payload)
+                if code != 409:  # "something else is still running" is not an answer to keep
+                    idem.finish(payload, code)
             return code, payload
-
-        slot_keys = locks[len(keys):] if locks else ()
-
-        class Record:
-            """The request's idempotency record, kept inside the action's own transactions: ``start`` in
-            its first (claim the key, or answer from it), ``finish`` in its last (store the answer)."""
-            keys = slot_keys
-
-            def start(self):
-                seen = merchant.repo.idempotent(slot)
-                if seen is not None:
-                    fingerprint, code, payload = seen
-                    if fingerprint != _fingerprint(body):
-                        return _error(422, "idempotency_conflict",
-                                      "Idempotency-Key has already been used with a different request body")
-                    if code == 0 and time.time() - payload.get("since", 0) < CLAIM_TTL_S:
-                        return _error(409, "idempotency_key_in_use",
-                                      "a request with this Idempotency-Key is still in progress; retry shortly")
-                    if code != 0:
-                        return JSONResponse(payload, status_code=code,
-                                            headers={"Idempotent-Replayed": "true", "Idempotency-Key": key})
-                merchant.repo.remember(slot, _fingerprint(body), 0, {"since": time.time()})  # 0: in progress
-                return None
-
-            def finish(self, payload):
-                merchant.repo.remember(slot, _fingerprint(body), status, payload)
 
         def act_alone():
             try:
-                done = action(body, Record())
+                done = action(body, idem)
             except (CheckoutError, _NotAllowed) as exc:  # refused: the first transaction rolled back
                 code, payload = _failure(request, exc)
-                with merchant.repo.transaction(keys=locks):
-                    merchant.repo.remember(slot, _fingerprint(body), code, payload)
+                if code != 409:
+                    with merchant.repo.transaction(keys=locks):
+                        idem.finish(payload, code)
                 return code, payload
+            except (Conflict, InFlight):  # the key belongs to another request: leave it alone
+                raise
             except BaseException:
                 with merchant.repo.transaction(keys=locks):
-                    merchant.repo.forget(slot)  # a fault is never remembered: a retry runs again
+                    idem.forget()  # a fault is never remembered: a retry runs again
                 raise
-            return done if isinstance(done, Response) else (status, done)
+            return done if isinstance(done, Replay) else (status, done)
 
         try:
             done = await blocking(act if atomic else act_alone)
+        except Conflict:
+            return _error(422, "idempotency_conflict", "Idempotency-Key has already been used with a different request body")
+        except InFlight:
+            busy = _error(409, "idempotency_in_flight", "A request with this Idempotency-Key is currently being processed")
+            busy.headers["Retry-After"] = str(RETRY_AFTER_S)
+            return busy
         except Exception:  # a fault rolls the change back, is a flat 500, and is never remembered
             log.exception("unhandled error in %s %s", request.method, request.url.path)
             return _error(500, "internal_error", "the request could not be processed", type_="processing_error")
-        if isinstance(done, Response):
-            return done
+        if isinstance(done, Replay):
+            return JSONResponse(done.payload, status_code=done.code,
+                                headers={"Idempotent-Replayed": "true", "Idempotency-Key": key})
         code, payload = done
-        return _respond(request, code, payload, {"Idempotency-Key": key})
+        return _respond(request, code, payload, {"Idempotency-Key": key,
+                                                 **({"Retry-After": str(RETRY_AFTER_S)} if code == 409 else {})})
 
     @app.get("/.well-known/acp.json")
     def discovery() -> dict:
@@ -270,7 +233,7 @@ def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[st
         """MCP's Streamable HTTP transport, answering every request with plain JSON (no SSE stream).
 
         The bearer token authenticates the caller, as on the REST API; idempotency keys in ``meta`` are
-        scoped to that caller. A notification gets 202 and no body, as the transport requires.
+        scoped to that caller and kept in the store's database, as the REST API's are. A notification gets 202 and no body, as the transport requires.
         """
         auth = request.headers.get("authorization", "")
         presented = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else None
@@ -282,12 +245,13 @@ def create_app(merchant: Merchant, tokens: dict[str, str], *, operators: dict[st
         except ValueError:
             return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}},
                                 status_code=400)
-        store = mcp_by_caller.setdefault(caller, MCPStore(merchant, kb=kb))
+        store = mcp_by_caller.setdefault(caller, MCPStore(merchant, kb=kb, caller=caller))
         batch = message if isinstance(message, list) else [message]
         replies = []
         for item in batch:
             try:
-                reply = store.handle(item) if isinstance(item, dict) else \
+                # database and payment work, off the event loop like every other route
+                reply = await blocking(lambda item=item: store.handle(item)) if isinstance(item, dict) else \
                     {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
             except Exception:  # a fault is a JSON-RPC internal error that says nothing about the inside
                 log.exception("unhandled MCP error")

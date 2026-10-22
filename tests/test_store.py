@@ -136,7 +136,7 @@ def test_a_crash_after_stripe_charged_does_not_charge_twice(target, monkeypatch)
     monkeypatch.setattr(m.repo, "add_order", add_order)
     with pytest.raises(RuntimeError):
         m.complete_session(sid, CARD)
-    assert not m.orders and m.get_session(sid)["status"] == "ready_for_payment"
+    assert not m.orders and m.get_session(sid)["status"] == "complete_in_progress"  # still marked
     out = m.complete_session(sid, CARD)
     assert out["status"] == "completed"
     assert len(stripe._calls["intents"]) == 1 and len(stripe._calls["keys"]) == 1
@@ -490,23 +490,30 @@ def test_charges_and_refunds_at_once_never_wait_on_each_other_forever(target):
 
 
 def test_over_http_a_second_request_waits_its_turn_and_the_charge_happens_once(target):
+    from shipjack.retry_vectors import held_rail, wait_marked
     w, m = shop(target)
-    w.processor.settle_delay_s = 0.6
     client = TestClient(create_app(m, {"t": "platform"}))
     head = {"Authorization": "Bearer t", "API-Version": ACP_API_VERSION}
     sid = client.post("/checkout_sessions", json={"items": [{"id": HUB.id}], "fulfillment_details": {"address": HOME}},
                       headers={**head, "Idempotency-Key": "c1"}).json()["id"]
     path = f"/checkout_sessions/{sid}/complete"
     first = {}
-    paying = threading.Thread(target=lambda: first.setdefault(
-        "r", client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k1"})))
-    paying.start()
-    time.sleep(0.25)
-    same_key = client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k1"})
-    other_key = client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k2"})
-    paying.join()
-    assert same_key.status_code == 409 and same_key.json()["code"] == "idempotency_key_in_use"
+    with held_rail(w) as release:  # the charge stays out until every retry has been answered
+        paying = threading.Thread(target=lambda: first.setdefault(
+            "r", client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k1"})))
+        paying.start()
+        wait_marked(m, sid)
+        same_key = client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k1"})
+        again = client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k1"})
+        other_key = client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k2"})
+        release.set()
+        paying.join()
+    assert again.json()["code"] == "idempotency_in_flight"  # a refused retry leaves the first request's key
+    later = client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k2"})
+    assert later.status_code == 400 and later.json()["code"] == "invalid"  # "in progress" was not stored for k2
+    assert same_key.status_code == 409 and same_key.json()["code"] == "idempotency_in_flight"  # ACP 2026-04-17
     assert other_key.status_code == 409 and other_key.json()["code"] == "payment_in_progress"
+    assert same_key.headers["Retry-After"] == other_key.headers["Retry-After"] == "1"
     assert first["r"].status_code == 200 and first["r"].json()["status"] == "completed"
     replay = client.post(path, json={"payment_data": CARD}, headers={**head, "Idempotency-Key": "k1"})
     assert replay.headers.get("Idempotent-Replayed") == "true" and replay.json() == first["r"].json()

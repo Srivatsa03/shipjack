@@ -163,6 +163,8 @@ def main(argv: list[str] | None = None) -> int:
     add_retrieval(sub)
     from .vectors import add_parser as add_vectors
     add_vectors(sub)
+    from .retry_vectors import add_parser as add_retry_vectors
+    add_retry_vectors(sub)
     args = p.parse_args(argv)
     return args.func(args)
 
